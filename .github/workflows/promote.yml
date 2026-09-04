@@ -1,0 +1,114 @@
+name: Validate and promote V1
+
+on:
+  push:
+    branches: [bodybuilder-build]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bodybuilder-v1-promotion
+  cancel-in-progress: false
+
+jobs:
+  validate-and-promote:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Normalize and lint source
+        run: |
+          ruff check --fix .
+          ruff format .
+          ruff check .
+
+      - name: Run test suite
+        run: pytest
+
+      - name: Run headless UI smoke test
+        run: |
+          python - <<'PY'
+          from PyQt6.QtWidgets import QApplication
+          from bodybuilder.ui.main_window import MainWindow
+
+          app = QApplication([])
+          window = MainWindow()
+          assert "BodyBuilder" in window.windowTitle()
+          window.close()
+          app.quit()
+          PY
+
+      - name: Run classical pipeline smoke test
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from PIL import Image, ImageDraw
+
+          from bodybuilder.config import BackendKind, PipelineConfig
+          from bodybuilder.core.pipeline import ReconstructionPipeline
+
+          with TemporaryDirectory() as temporary:
+              root = Path(temporary)
+              source = root / "source"
+              output = root / "output"
+              source.mkdir()
+              image = Image.new("RGB", (320, 240), "white")
+              draw = ImageDraw.Draw(image)
+              draw.rectangle((50, 40, 270, 200), fill=(40, 110, 190))
+              draw.ellipse((110, 70, 210, 170), fill=(230, 170, 90))
+              image.save(source / "fragment.png")
+              config = PipelineConfig(
+                  input_dir=source,
+                  output_dir=output,
+                  backend=BackendKind.CLASSICAL,
+                  completion_margin_percent=25,
+                  target_long_edge=512,
+                  stitch_overlaps=False,
+                  upscale_2x=False,
+              )
+              result = ReconstructionPipeline(config).run()
+              assert len(result.output_paths) == 1
+              assert result.output_paths[0].exists()
+              assert result.manifest_path.exists()
+          PY
+
+      - name: Build one clean V1 commit on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Niko-Pix-kit automation"
+          git config user.email "actions@users.noreply.github.com"
+
+          git add -A
+          git commit --allow-empty -m "Validated BodyBuilder V1 release tree"
+          validated_commit="$(git rev-parse HEAD)"
+
+          git fetch origin main
+          git checkout --detach origin/main
+          git rm -rf .
+          git checkout "$validated_commit" -- .
+          git rm -f .github/workflows/promote.yml
+          git add -A
+          git commit -m "V1"
+          git push origin HEAD:main
+          git push origin --delete bodybuilder-build
