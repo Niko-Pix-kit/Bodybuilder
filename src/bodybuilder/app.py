@@ -43,7 +43,7 @@ def main() -> int:
     app.setApplicationName("BodyBuilder")
     app.setOrganizationName("Niko-Pix-kit")
     try:
-        from bodybuilder.ui.main_window import MainWindow
+        from bodybuilder.ui.subject_window import MainWindow
         window = MainWindow()
     except Exception:
         # Startup boundary: report and exit nonzero, without swallowing the traceback.

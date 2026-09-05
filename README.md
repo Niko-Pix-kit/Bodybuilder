@@ -1,10 +1,10 @@
 # BodyBuilder
 
-A local PyQt6 application for completing cropped photographs using other fragments of the same person or object as references. The interface and code are in English.
+Local PyQt6 reconstruction of a person or an object from complementary photographic fragments. Code and interface are in English.
 
-## Update and launch in an existing Python environment
+## Update in your existing environment
 
-From your repository folder, using the Python interpreter already selected in your IDE:
+From the repository directory, use the same Python interpreter that launches the application:
 
 ```bash
 git pull --ff-only origin main
@@ -12,49 +12,56 @@ python -m pip install -r requirements.txt
 python -m bodybuilder
 ```
 
-No new virtual environment is needed. Python 3.11–3.13 is supported. `requirements.txt` installs the editable application and its local AI dependencies from `pyproject.toml`.
+Python 3.11-3.13 is supported. No new virtual environment is required. Version 0.3 requires the dependency update for native Florence-2 support.
 
-## Simple workflow
+## Choose the result, not technical diffusion parameters
 
-Select **Source folder**, select **Save results to**, and click **Reconstruct**. Put only photographs of the same person or object in a source folder. Person mode, automatic device selection and one completion per source are the defaults. Analysis runs automatically. Technical options are hidden under **Advanced options**; old saved engine settings cannot silently select the non-generative preview.
+The desktop default is **Complete subject - new full view**. Select a source folder containing original fragments of one physical subject, select the result folder, and click **Reconstruct**. The application proposes the common subject, collects complementary parts, and generates a new whole-subject composition rather than inheriting the cut-off framing of the photographs. Optional extra synthetic views use the same original evidence.
 
-**Cropped edges:** the application extends the canvas around the photographed portion. It does not require a detectable complete face. The default frame is portrait; frame and extension can be changed under Advanced options. A thin fragment will not create a degenerate, thin AI canvas.
+Choose **Restore each original photo using all fragments** to preserve the existing photo's perspective and working-resolution observed pixels while repairing its missing areas. This is a separate operation from generating a complete subject in a new pose.
 
-**Missing areas inside an image:** select a source photo and click **Mark missing area in selected photo**. Paint only the part to reconstruct. Marks are saved alongside the original as `photo.jpg.mask.png` (white = missing, black = keep). The original is not overwritten. Transparent PNG regions are also treated as missing. Ordinary black/white photographic content is not automatically erased: use the marking tool for opaque obstruction or blank patches.
+**Advanced options** contains an optional short **Subject hint**, such as `person`, `bicycle`, or `vase`, for ambiguous detection. Use original fragments of the same instance: common-category detection cannot prove that two similar objects or people are the same subject.
 
-**Additional poses/views:** optional under Advanced options. These are entirely synthetic, not restored photographs. Completing a close-up and generating a full-body view are different tasks; the application cannot infer an unseen body faithfully from one facial fragment.
+## Complementary details and provenance
 
-## Results, not masks
+A local Florence-2 detector proposes subjects and parts. Generic parts and targeted person details use the same evidence selection and regional refinement mechanism. Transparent or explicitly masked regions do not count as visible evidence. Obvious empty/erased part crops are excluded from detailed references.
 
-Each run has this structure:
+Genuinely overlapping fragments are tested with masked SIFT/RANSAC and photometric agreement before a non-generative assembly is accepted. Different poses are not forced into one planar collage. During generation, localized parts can be refined from different original photographs using spatial reference masks; for example, eyes from one source and mouth details from another.
+
+Whole-view framing is checked, and a bounded retry is used for detected clipping. A conditional eyewear check discourages introducing glasses when visible eye references do not support them. These are imperfect model-based checks, not guarantees of exact facial identity, unseen anatomy, or geometry.
+
+All files are inspected. Diffusion uses at most 16 selected references and four regional refinements per output. The selected original paths, part coordinates, registration transforms and uncertainty notices are recorded. See [Joint reconstruction](docs/JOINT_RECONSTRUCTION.md) for the algorithm, budgets and limitations.
+
+## Missing regions inside a photograph
+
+Select an original and click **Mark missing area in selected photo**. Paint the opaque erasure or obstruction to reconstruct. A sidecar `photo.jpg.mask.png` is saved; the original is not overwritten. White in the sidecar means missing, black means keep. Transparent regions are recognized automatically. Ordinary black or white object surfaces are not automatically deleted.
+
+## Output
 
 ```text
 BodyBuilder_YYYYMMDD_HHMMSS/
-  images/                  # completed photographs only
-  diagnostics/             # evidence masks, working canvases, per-image metadata
-  bodybuilder.log          # processing details and errors
-  run_manifest.json        # status, sources, SHA-256 hashes, versions and outputs
+  images/                    # final photographs only
+  diagnostics/               # source parts, assemblies, drafts, masks, metadata
+  subject_evidence.json      # common-subject candidate and selected part sources
+  run_manifest.json          # status, source hashes, versions, outputs, warnings
+  bodybuilder.log
 ```
 
-The **Reconstructed images** tab and **Open reconstructed images** button show final images only. Black/white diagnostic masks are never shown as reconstructed photographs. Source scanning excludes explicit masks and previous run folders.
+The result tab and **Open reconstructed images** show photographs, not diagnostic masks. Do not feed generated results back as original evidence. The application retains completed images and error diagnostics when a later stage fails.
 
-The developer-only classical backend writes to `diagnostic_previews/`, not `images/`. It is not offered in the desktop reconstruction workflow and is never used as an automatic fallback.
+## Local AI and resource requirements
 
-## AI and failure handling
+SDXL inpainting plus IP-Adapter handles generation; native Florence-2 handles subject/part localization. Models download on first use. Photographs are not uploaded by BodyBuilder. Remote model Python code is not enabled. Detection runs on CPU; generation uses the selected compute device. The extra analysis and regional passes make this workflow slower and more memory-intensive than a single outpainting pass. CPU generation can be very slow.
 
-The local backend uses SDXL inpainting and IP-Adapter Plus. Its ViT-H encoder is explicitly loaded from `h94/IP-Adapter/models/image_encoder`; the different encoder under `sdxl_models/image_encoder` is not compatible with these Plus weights. Each reference is encoded separately and padded without center-cropping away fragment edges. Up to 16 references are used per source; the source itself is always included and the exact list is recorded.
-
-The reference adapter must load successfully. The application stops with an error rather than quietly generating without the reference photographs. Floating-point pixels are checked before image conversion. Empty, almost uniform, mask-like or unchanged generated regions are rejected, with one full-precision retry. Repeated failure does not export a blank image as success. This is a technical sanity check, not an assessment of identity accuracy. A genuinely featureless region can also trigger the conservative check; inspect the log in that case.
-
-Models download on first use. Photos are processed locally and are not uploaded by BodyBuilder. CPU inference is supported but can be very slow. Cancellation is checked between stages and diffusion steps; an active model download/loading call cannot be interrupted immediately.
+Initialization, non-finite outputs, blank images and cancellations are handled explicitly. Numerical retry and framing retry are bounded. An active model download cannot stop immediately.
 
 ## Fidelity limits
 
-Observed pixels are restored **at the AI working resolution** after generation. Inputs are resampled to fit that canvas. Optional 2x enhancement does not generatively repaint observed details: those areas are restored with deterministic Lanczos resizing. It cannot recover facial details that were never recorded. Different poses are used as references rather than automatically stitched together; geometric stitching remains an explicit programmatic option for genuine overlaps.
+New compositions are fully generated. They are not recovered originals or a persistent 3D model. Visible original regions in source-repair mode are preserved at the AI working resolution; inputs are resized for that canvas. Optional 2x output restores those observed areas with deterministic Lanczos resampling.
 
-Missing facial/body/object parts remain estimates and may be incorrect. Keep the metadata when sharing outputs. Only process photographs you are authorized to use.
+Unseen sides, body parts and fine details remain hypotheses. A partial photograph cannot uniquely determine all of them. Similar-looking sources can be mismatched, and semantic part localization can fail. Review the evidence report and actual outputs before relying on them. Only process photographs you are authorized to use.
 
-## Testing
+## Development
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -63,6 +70,4 @@ python -m compileall -q src tests
 QT_QPA_PLATFORM=offscreen pytest
 ```
 
-Tests cover mask handling, source preservation, invalid output rejection, reference loader configuration, retry limits, file separation, manifests and the simplified UI. Model calls in regression tests are mocked: these tests do **not** demonstrate visual fidelity on real photographs. Assess that separately on representative, authorized source fragments with the actual model and hardware.
-
-Technical references: [IP-Adapter model card](https://huggingface.co/h94/IP-Adapter), [Diffusers IP-Adapter guide](https://huggingface.co/docs/diffusers/en/using-diffusers/ip_adapter).
+CI includes real feature-registration tests, controlled pipeline/UI regressions, actual Diffusers API tests, and a real-weight detector smoke test on a synthetic fixture. These tests do not establish reconstruction fidelity on private photographs. No user photographs are included in the repository or CI.

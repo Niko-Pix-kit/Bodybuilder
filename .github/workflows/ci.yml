@@ -29,20 +29,20 @@ jobs:
         run: ruff check .
       - name: Compile
         run: python -m compileall -q src tests
-      - name: Test core and offscreen desktop UI (no model downloads)
+      - name: Test core and offscreen desktop UI
         run: pytest
 
   ai-api:
     name: Real AI APIs (${{ matrix.stack }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
           - stack: minimum
             diffusers: diffusers==0.31.0
-            transformers: transformers==4.44.2
+            transformers: transformers==4.57.1
           - stack: current
             diffusers: diffusers
             transformers: transformers
@@ -58,11 +58,19 @@ jobs:
         run: python -m pip install -e ".[ai,dev]" "${{ matrix.diffusers }}" "${{ matrix.transformers }}"
       - name: Record installed versions
         run: python -m pip freeze
-      - name: Verify real inpainting and VAE APIs without downloading model weights
+      - name: Verify real inpainting, VAE and region-conditioning APIs
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
           BODYBUILDER_REQUIRE_AI_TESTS: "1"
           OMP_NUM_THREADS: "1"
           MKL_NUM_THREADS: "1"
-        run: python -m pytest tests/test_diffusers_runtime.py -v
+        run: python -m pytest tests/test_diffusers_runtime.py tests/test_subject_runtime.py -v
+      - name: Load actual subject detector and run all three vision tasks
+        if: matrix.stack == 'current'
+        env:
+          BODYBUILDER_REQUIRE_AI_TESTS: "1"
+          BODYBUILDER_TEST_VISION_WEIGHTS: "1"
+          OMP_NUM_THREADS: "2"
+          MKL_NUM_THREADS: "2"
+        run: python -m pytest tests/test_subject_runtime.py::test_subject_detector_with_real_weights -v
