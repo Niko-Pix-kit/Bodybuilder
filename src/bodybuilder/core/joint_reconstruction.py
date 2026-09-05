@@ -17,9 +17,19 @@ from bodybuilder.ai.base import BackendFatalError, GenerationCancelled
 from bodybuilder.ai.evidence_sdxl import EvidenceRequest, EvidenceSdxlBackend
 from bodybuilder.ai.subject_vision import SubjectVision
 from bodybuilder.config import BackendKind, SubjectKind, VariantFrame
-from bodybuilder.core.canvas import prepare_outpaint_canvas, prepare_variant_canvas, preserve_observed_pixels
+from bodybuilder.core.canvas import (
+    prepare_outpaint_canvas,
+    prepare_variant_canvas,
+    preserve_observed_pixels,
+)
 from bodybuilder.core.fragment_registration import assemble_overlap, repair_from_overlaps
-from bodybuilder.core.image_io import ensure_unique_path, load_fragment, safe_stem, save_png, write_json
+from bodybuilder.core.image_io import (
+    ensure_unique_path,
+    load_fragment,
+    safe_stem,
+    save_png,
+    write_json,
+)
 from bodybuilder.core.pipeline import (
     PipelineCancelled,
     PipelineRunResult,
@@ -246,7 +256,6 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                             "reference detail, seamlessly integrated with the surrounding photograph. " + prompt)
             request = self._request(image, mask, (part.image,), local_prompt, negative,
                                     seed + 100 + index, target_masks=(mask,))
-            # Refine from a valid draft instead of diffusing every detail from noise.
             request.strength = 0.75
             replacement = self._call(request, done, total, f"Reconstructing {part.name} from {part.source.name}")
             # Feather inward only. Never change an observed pixel outside the allowed mask.

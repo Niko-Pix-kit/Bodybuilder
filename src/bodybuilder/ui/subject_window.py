@@ -7,7 +7,15 @@ import traceback
 
 from PyQt6.QtCore import QThread, QUrl, pyqtSlot
 from PyQt6.QtGui import QDesktopServices
-from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QWidget
+from PyQt6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QWidget,
+)
 
 from bodybuilder.config import SubjectKind
 from bodybuilder.core.joint_reconstruction import JointReconstructionPipeline

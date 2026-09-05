@@ -12,7 +12,12 @@ from PIL import Image
 from bodybuilder.ai.subject_vision import Region
 
 _PERSON = {"person", "woman", "man", "girl", "boy", "face", "human", "lady", "people"}
-_STOP = set("a an the of with on in at and its is are this that some pair visible close up view photo image part front back side left right black white red blue green brown small large wearing standing sitting".split())
+_STOP = {
+    "a", "an", "the", "of", "with", "on", "in", "at", "and", "its", "is", "are",
+    "this", "that", "some", "pair", "visible", "close", "up", "view", "photo", "image",
+    "part", "front", "back", "side", "left", "right", "black", "white", "red", "blue",
+    "green", "brown", "small", "large", "wearing", "standing", "sitting",
+}
 # Localization hints only; selection and refinement are shared with arbitrary objects.
 PERSON_PARTS = ("eyes", "mouth", "hair", "nose", "hands", "feet")
 
@@ -26,7 +31,6 @@ def subject_key(label: str) -> str:
 
 def part_key(label: str) -> str:
     words = re.findall(r"[a-z]+", label.lower())
-    # Keep only explicit short region names. Long descriptions are never treated as facts.
     for key, aliases in (("eyes", {"eye", "eyes"}), ("mouth", {"mouth", "lip", "lips"}),
                          ("hair", {"hair"}), ("nose", {"nose"})):
         if set(words) & aliases:
@@ -140,8 +144,6 @@ def visible_part(view: SourceView, region: Region, name: str) -> PartEvidence | 
     crop = view.image.crop(box)
     gray = cv2.cvtColor(np.asarray(crop), cv2.COLOR_RGB2GRAY)
     valid = gray[mask]
-    # An opaque white erasure must not become a mouth reference. This is a crop
-    # eligibility rule, never automatic erasure of white pixels in an original.
     if valid.std() < 5 or ((valid > 248) | (valid < 5)).mean() > 0.70:
         return None
     detail = float(cv2.Laplacian(gray, cv2.CV_64F).var())
@@ -170,7 +172,6 @@ def build_evidence(views: list[SourceView], vision, *, hint: str = "", log=lambd
         regions = vision.describe_regions(view.image)
         evidence.accessory_labels.update(r.label for r in (*view.detections, *regions))
         if subject_key(label) == "person":
-            # Targeted part queries supplement generic region captions for small facial details.
             for name in PERSON_PARTS:
                 regions.extend(Region(name, r.box) for r in vision.locate(view.image, name))
         for region in regions:
@@ -206,10 +207,12 @@ def full_subject_prompt(evidence: SubjectEvidence, index: int, description: str 
               "as the reference photographs, no additional accessories. " + description.strip())
     negative = ("cropped subject, close-up, selfie, extreme perspective, cut-off head, cut-off feet, "
                 "body out of frame, collage, split image, duplicate subject, extra parts, text, watermark")
-    if person and any(part.name == "eyes" for part in evidence.parts):
-        if not any(re.search(r"\b(sunglasses|glasses|goggles|spectacles)\b", label) for label in evidence.accessory_labels):
-            prompt += " Unobstructed eyes matching the visible eye references."
-            negative += ", sunglasses, eyeglasses, goggles, spectacles"
+    uncovered_eyes = any(part.name == "eyes" for part in evidence.parts)
+    eyewear_in_sources = any(re.search(r"\b(sunglasses|glasses|goggles|spectacles)\b", label)
+                            for label in evidence.accessory_labels)
+    if person and uncovered_eyes and not eyewear_in_sources:
+        prompt += " Unobstructed eyes matching the visible eye references."
+        negative += ", sunglasses, eyeglasses, goggles, spectacles"
     return prompt, negative
 
 

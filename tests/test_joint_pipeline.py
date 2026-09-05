@@ -3,6 +3,7 @@ import json
 import threading
 from dataclasses import asdict
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 from PIL import Image
@@ -33,8 +34,8 @@ class Vision:
 
 
 class Backend:
-    last_generation_metadata = {}
-    calls = []
+    last_generation_metadata: ClassVar[dict] = {}
+    calls: ClassVar[list] = []
     def __init__(self, **kwargs):
         pass
     def prepare(self):
@@ -105,6 +106,7 @@ def test_new_request_fields_do_not_change_existing_configuration(tmp_path):
 
 def test_cancellation_before_model_download(tmp_path):
     import pytest
+
     from bodybuilder.ai.base import GenerationCancelled
     from bodybuilder.ai.subject_vision import SubjectVision
     event = threading.Event()
