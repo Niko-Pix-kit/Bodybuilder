@@ -1,0 +1,4 @@
+# Core application plus lint and test tools; no model downloads or local AI stack.
+# Run from the repository root. Install requirements.txt as well for AI development.
+# Dependency names and version ranges are maintained only in pyproject.toml.
+-e .[dev]

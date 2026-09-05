@@ -28,34 +28,64 @@ No model can recover pixels that were never captured. BodyBuilder uses the avail
 
 ## Installation
 
-Python 3.11 to 3.13 is supported.
+Python 3.11 to 3.13 is required. Use the **same Python interpreter for installation and launch**. An existing virtual environment can be reused: do not recreate it. A Git pull updates source files, not the packages installed in that environment.
 
-### Full local AI installation
+### Full local AI installation in an existing environment
+
+Run these commands from the repository root. Here, `python` must be the interpreter selected in your IDE or existing environment:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[ai]"
-bodybuilder
+python -m pip install -r requirements.txt
+python -m bodybuilder
 ```
 
-On Windows, activate with:
+An environment does not need to be activated when its interpreter is called explicitly:
 
-```powershell
-.venv\Scripts\activate
+```bash
+/path/to/existing/environment/bin/python -m pip install -r requirements.txt
+/path/to/existing/environment/bin/python -m bodybuilder
 ```
 
-Install a PyTorch build appropriate for your GPU before installing the project when the default PyTorch package is not suitable for your system.
+Replace the example interpreter path with your actual environment path. On Windows, use that environment's `Scripts\python.exe` instead.
+
+`requirements.txt` installs the project in editable mode with its `ai` extra. This includes PyQt6, NumPy, OpenCV, Pillow, pillow-heif, PyTorch, Diffusers, Transformers, Accelerate, and safetensors, plus their dependencies. The authoritative dependency declarations and version ranges remain in `pyproject.toml`, avoiding duplicate lists that can drift apart. These requirements files are installation entry points, not fully pinned lockfiles.
+
+Install a PyTorch build appropriate for your GPU before installing the project when the default PyTorch package is not suitable for your system. Installing Python packages does not install a GPU driver. Model weights download separately on first use.
+
+### Updating an existing checkout
+
+From the repository root, using your existing environment's interpreter:
+
+```bash
+git fetch origin &&
+git switch main &&
+git pull --ff-only origin main &&
+python -m pip install -r requirements.txt &&
+python -m bodybuilder
+```
+
+These commands do not discard local changes. Resolve any Git error before continuing with installation.
 
 ### Lightweight installation
 
 ```bash
-python -m pip install -e .
-bodybuilder
+python -m pip install -r requirements-minimal.txt
+python -m bodybuilder
 ```
 
-The lightweight installation can analyze images, create provenance assets, and test geometric overlap stitching. Choose **Classical preview (no generative AI)** in the interface. It cannot plausibly invent large missing body or object regions.
+The lightweight installation includes PyQt6 and the image-processing dependencies, but not the local AI stack. It can analyze images, create provenance assets, and test geometric overlap stitching. Choose **Classical preview (no generative AI)** in the interface and disable **Enhance final images 2x** to avoid requesting the optional AI upscaler. It cannot plausibly invent large missing body or object regions.
+
+### Missing PyQt6 or another dependency
+
+`ModuleNotFoundError: No module named 'PyQt6'` means that the interpreter launching the application cannot import PyQt6. Install the requirements with that exact interpreter, rather than an unrelated `pip` executable:
+
+```bash
+/path/to/existing/environment/bin/python -m pip install -r requirements.txt
+/path/to/existing/environment/bin/python -m pip check
+/path/to/existing/environment/bin/python -c "from PyQt6.QtWidgets import QApplication; print('PyQt6 import OK')"
+```
+
+In an IDE, select the same interpreter and run the module `bodybuilder` rather than executing `src/bodybuilder/__main__.py` as a standalone script. Editable installation registers the `src` package without requiring a custom `PYTHONPATH`.
 
 ## First run
 
@@ -128,7 +158,7 @@ The application does not perform face recognition, identify a person, or compare
 ## Development
 
 ```bash
-python -m pip install -e ".[dev]"
+python -m pip install -r requirements-dev.txt
 ruff check .
 pytest
 ```
@@ -136,7 +166,7 @@ pytest
 Install all AI and development dependencies with:
 
 ```bash
-python -m pip install -e ".[ai,dev]"
+python -m pip install -r requirements.txt -r requirements-dev.txt
 ```
 
 See [Architecture](docs/ARCHITECTURE.md) and [Fidelity and limitations](docs/FIDELITY_AND_LIMITATIONS.md).

@@ -1,0 +1,4 @@
+# Interface, image analysis, and classical preview only; no local AI stack.
+# Run from the repository root using the application's existing Python interpreter.
+# Dependency names and version ranges are maintained only in pyproject.toml.
+-e .

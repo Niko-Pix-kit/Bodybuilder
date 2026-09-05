@@ -1,0 +1,6 @@
+# Full application: PyQt6 interface, image processing, and local AI backends.
+# Run from the repository root with the Python interpreter used to launch BodyBuilder:
+# /path/to/existing/environment/bin/python -m pip install -r requirements.txt
+# Dependency names and version ranges are maintained only in pyproject.toml.
+# Editable installation also makes the src-layout package importable outside the IDE.
+-e .[ai]
