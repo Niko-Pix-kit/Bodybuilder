@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
@@ -23,6 +24,7 @@ from bodybuilder.core.canvas import (
     preserve_observed_pixels,
 )
 from bodybuilder.core.fragment_registration import assemble_overlap, repair_from_overlaps
+from bodybuilder.core.framing import FramingAssessment, assess_framing, make_recovery_canvas
 from bodybuilder.core.image_io import (
     ensure_unique_path,
     load_fragment,
@@ -40,7 +42,6 @@ from bodybuilder.core.pipeline import (
 from bodybuilder.core.subject_evidence import (
     SourceView,
     build_evidence,
-    check_whole_framing,
     full_subject_prompt,
     subject_key,
 )
@@ -48,6 +49,12 @@ from bodybuilder.core.subject_evidence import (
 
 class EvidenceConsistencyError(BackendFatalError):
     """A semantic check found an unsupported change, not a numerical failure."""
+
+
+@dataclass(slots=True)
+class JointRunResult(PipelineRunResult):
+    review_paths: list[str] = field(default_factory=list)
+    review_messages: list[str] = field(default_factory=list)
 
 
 class JointReconstructionPipeline(ReconstructionPipeline):
@@ -59,7 +66,7 @@ class JointReconstructionPipeline(ReconstructionPipeline):
         self.evidence = None
         self.backend = None
 
-    def run(self) -> PipelineRunResult:
+    def run(self) -> JointRunResult:
         if self.config.backend != BackendKind.SDXL:
             raise ValueError("Joint subject reconstruction requires the real AI backend")
         self._validate_paths()
@@ -69,11 +76,13 @@ class JointReconstructionPipeline(ReconstructionPipeline):
         self.logger = logging.getLogger(f"bodybuilder.joint.{id(self)}")
         self.logger.setLevel(logging.INFO)
         handler = logging.FileHandler(self.run_dir / "bodybuilder.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         self.logger.addHandler(handler)
-        result = PipelineRunResult(self.run_dir, self.run_dir / "run_manifest.json")
+        result = JointRunResult(self.run_dir, self.run_dir / "run_manifest.json")
         manifest = {"status": "running", "workflow": "whole_subject" if self.complete_subject else "joint_source_repair",
                     "config": self.config.to_dict(), "environment": environment_report(),
-                    "sources": [], "outputs": [], "errors": [], "warnings": []}
+                    "sources": [], "outputs": [], "errors": [], "warnings": [],
+                    "review_required": False, "review_count": 0}
         try:
             write_json(result.manifest_path, manifest)
             self.callbacks.progress(0, 0, "Finding the common subject and complementary visible parts...")
@@ -94,8 +103,7 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                                             "evidence_working_size": image.size})
             hint = self.subject_hint or ("person" if self.config.subject_kind == SubjectKind.PERSON else "")
             self.evidence = build_evidence(views, self.vision, hint=hint, log=self._log)
-            # Register genuinely overlapping views before any generative operation.
-            # Limit pair attempts, not source inspection, to keep costs bounded.
+            # Register genuine overlaps before generation, with a bounded pair budget.
             for a, anchor in enumerate(views[:8]):
                 for b, donor in enumerate(views[a + 1:8], a + 1):
                     self._check_cancelled()
@@ -107,7 +115,7 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                         save_png(mask, folder / "observed_mask.png")
                         record["evidence_image"] = str(folder / "evidence.png")
                         self.evidence.assemblies.append((merged, record))
-            manifest["warnings"] = self.evidence.warnings
+            manifest["warnings"] = list(self.evidence.warnings)
             write_json(self.run_dir / "subject_evidence.json", self.evidence.report())
             for warning in self.evidence.warnings:
                 self._log("REVIEW: " + warning)
@@ -134,16 +142,30 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                         self._log(f"Unsupported generated detail: {exc}. Retrying the view once.")
                 if view is None:
                     synthetic_index += 1
+                if record.get("review_required"):
+                    result.review_paths.append(record["image"])
+                    for warning in record["warnings"]:
+                        message = f"{record['image']}: {warning}"
+                        result.review_messages.append(message)
+                        manifest["warnings"].append(message)
+                    manifest["review_required"] = True
+                    manifest["review_count"] = len(result.review_paths)
                 self._record_output(record, result, manifest)
             if not result.output_paths:
                 raise BackendFatalError("No subject reconstruction was produced")
-            manifest["status"] = "completed_with_errors" if result.errors else "completed"
-            self.callbacks.progress(len(tasks), len(tasks), f"Saved {len(result.output_paths)} reconstructed view(s)")
+            if result.errors:
+                manifest["status"] = "completed_with_errors"
+            elif result.review_paths:
+                manifest["status"] = "completed_with_warnings"
+            else:
+                manifest["status"] = "completed"
+            self.callbacks.progress(len(tasks), len(tasks),
+                f"Saved {len(result.output_paths)} view(s); {len(result.review_paths)} need framing review")
         except (GenerationCancelled, PipelineCancelled):
             result.cancelled = True
             manifest["status"] = "cancelled"
         except Exception as exc:
-            # Application boundary: keep failures and completed outputs, then propagate.
+            # Operational/model errors still fail explicitly; only framing is advisory.
             manifest["status"] = "failed"
             self._record_error(exc, result, manifest, "joint reconstruction")
             raise
@@ -176,6 +198,13 @@ class JointReconstructionPipeline(ReconstructionPipeline):
         return self.backend.generate(request, cancel_event=self.cancel_event,
             progress=lambda step, steps, message: self.callbacks.progress(done, total, f"{label}: {step}/{steps}"))
 
+    def _assess_frame(self, image: Image.Image, done: int, total: int) -> FramingAssessment:
+        self._check_cancelled()
+        self.callbacks.progress(done, total, "Checking framing (advisory, not proof of completeness)...")
+        regions = self.vision.locate(image, self.evidence.label)
+        self._check_cancelled()
+        return assess_framing((region.box for region in regions), image.size)
+
     def _reconstruct_view(self, view, synthetic_index, done, total, semantic_attempt=0):
         references, reference_records = self.evidence.references()
         synthetic = view is None
@@ -191,47 +220,87 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                 margin_percent=self.config.completion_margin_percent, target_long_edge=self.config.target_long_edge)
             prompt = (f"Restore missing portions of the same {self.evidence.label}, preserve this photo's "
                       "perspective and its visible details. Use the complementary source parts. " + self.config.custom_prompt)
-        framing = None
-        for attempt in range(2 if synthetic else 1):
-            request = self._request(canvas.image, canvas.generated_mask, references, prompt, negative,
-                                    seed + attempt, free=synthetic)
-            draft = self._call(request, done, total, "Creating a complete composition" if synthetic else "Restoring source photo")
-            draft = preserve_observed_pixels(draft, canvas.image, canvas.generated_mask)
-            if not synthetic:
-                break
-            self.callbacks.progress(done, total, "Checking whole-subject framing...")
-            framing = check_whole_framing(self.vision.locate(draft, self.evidence.label), draft.size)
-            if framing is None:
-                break
-            self._log(f"Framing check: {framing}. Attempt {attempt + 1}/2.")
-            prompt += " Wide shot, small subject occupying the middle half of the frame, everything visible."
-        if synthetic and framing:
-            raise BackendFatalError(f"Could not produce a safely framed whole subject after two attempts: {framing}")
-        self._check_cancelled()
         slug = f"subject__whole_{synthetic_index + 1:02d}" if synthetic else f"source__{done + 1:03d}_{safe_stem(view.path.stem)}"
-        save_png(draft, self.run_dir / "diagnostics" / slug / "draft.png")
+        diagnostics = self.run_dir / "diagnostics" / slug / f"semantic_{semantic_attempt + 1:02d}"
+        request = self._request(canvas.image, canvas.generated_mask, references, prompt, negative, seed, free=synthetic)
+        draft = self._call(request, done, total, "Creating a complete composition" if synthetic else "Restoring source photo")
+        draft = preserve_observed_pixels(draft, canvas.image, canvas.generated_mask)
         draft_metadata = dict(self.backend.last_generation_metadata)
+        save_png(draft, diagnostics / "draft_01.png")
+        framing_history = []
+        selected_draft = 1
+        if synthetic:
+            assessment = self._assess_frame(draft, done, total)
+            framing_history.append({"stage": "initial", "seed": seed, **assessment.report(),
+                                    "generation": draft_metadata})
+            write_json(diagnostics / "framing_history.json", framing_history)
+            if not assessment.passed:
+                self._log(f"Framing review: {assessment.message}. Trying one bounded layout correction.")
+                correction_prompt = prompt + " Wide shot, one small centered subject, entire silhouette visible with space on every side."
+                if assessment.status == "edge_contact":
+                    # A real inpainting pass completes the new margins. The central
+                    # generated draft is protected, but never counted as source evidence.
+                    recovery = make_recovery_canvas(draft)
+                    retry_canvas, retry_mask = recovery.image, recovery.missing
+                    correction_prompt += " Continue the subject and background naturally into the missing margins."
+                    correction_kind = "outpaint_generated_draft"
+                    placement = recovery.draft_box
+                    free = False
+                    save_png(retry_canvas, diagnostics / "recovery_canvas.png")
+                    save_png(retry_mask, diagnostics / "recovery_generated_mask.png")
+                else:
+                    retry_canvas, retry_mask = canvas.image, canvas.generated_mask
+                    correction_kind, placement, free = "new_composition", None, True
+                retry = self._request(retry_canvas, retry_mask, references,
+                    correction_prompt, negative, seed + 1, free=free)
+                retry.strength = 1.0
+                candidate = self._call(retry, done, total, "Correcting subject framing")
+                candidate = preserve_observed_pixels(candidate, retry_canvas, retry_mask)
+                candidate_metadata = dict(self.backend.last_generation_metadata)
+                save_png(candidate, diagnostics / "draft_02.png")
+                corrected = self._assess_frame(candidate, done, total)
+                framing_history.append({"stage": correction_kind, "seed": seed + 1,
+                    "prompt": correction_prompt, "draft_box": placement,
+                    "draft_is_generated_not_observed": True, **corrected.report(),
+                    "generation": candidate_metadata})
+                write_json(diagnostics / "framing_history.json", framing_history)
+                if corrected.rank <= assessment.rank:
+                    draft, draft_metadata = candidate, candidate_metadata
+                    selected_draft = 2
+                else:
+                    self._log("Layout correction had a weaker detector assessment; retaining the initial draft.")
+        self._check_cancelled()
         final, details = self._refine_parts(draft, canvas.generated_mask, prompt, negative, seed, done, total)
         final = preserve_observed_pixels(final, canvas.image, canvas.generated_mask)
-        # Inspect again after regional editing; no failed candidate is exported as final.
+        warnings = []
+        final_check = None
         if synthetic:
-            framing = check_whole_framing(self.vision.locate(final, self.evidence.label), final.size)
-            if framing:
-                raise BackendFatalError("Regional reconstruction changed whole-subject framing: " + framing)
+            final_check = self._assess_frame(final, done, total)
+            framing_history.append({"stage": "after_regional_refinement", **final_check.report()})
+            write_json(diagnostics / "framing_history.json", framing_history)
+            if not final_check.passed:
+                warnings.append("Framing needs visual review: " + final_check.message +
+                    ". Image retained; complete anatomy or geometry has not been confirmed.")
+                self._log("REVIEW: " + warnings[-1])
+        # Keep unrelated consistency/model errors distinct from uncertain framing.
         if synthetic and "sunglasses" in negative:
             labels = [r.label for r in self.vision.describe_regions(final)]
             if any(re.search(r"\b(sunglasses|goggles|eyeglasses|spectacles)\b", text) for text in labels):
                 raise EvidenceConsistencyError("Eyewear was generated despite visible eye references without it")
+        output_slug = slug + "__needs_review" if warnings else slug
         return self._save_output(image=final, source_canvas=canvas.image,
             observed_mask=canvas.observed_mask, generated_mask=canvas.generated_mask,
-            output_base=self.run_dir / "images" / slug,
+            output_base=self.run_dir / "images" / output_slug,
             metadata={"kind": "whole_subject" if synthetic else "joint_source_repair",
-                      "fully_synthetic": synthetic, "seed": seed, "semantic_attempt": semantic_attempt + 1, "prompt": prompt, "negative_prompt": negative,
+                      "fully_synthetic": synthetic, "seed": seed, "semantic_attempt": semantic_attempt + 1,
+                      "prompt": prompt, "negative_prompt": negative,
                       "reference_evidence": reference_records, "parts_applied": details,
                       "same_view_recovery": recovered, "draft_generation": draft_metadata,
-                      "framing_check": "bounding_box_margin_passed" if synthetic else "source_view_preserved",
+                      "selected_draft": selected_draft, "framing_history": framing_history,
+                      "framing_check": ("needs_review" if warnings else "bounding_box_margin_passed") if synthetic else "source_view_preserved",
+                      "review_required": bool(warnings), "warnings": warnings,
                       "identity_accuracy": "not_verified", "complete_geometry": "not_verified",
-                      "notice": "New views are generated hypotheses; all local detail passes use original evidence, not generated references."})
+                      "notice": "New views are generated hypotheses; original photographs alone supply the references. Framing checks are advisory."})
 
     def _refine_parts(self, image, allowed_mask, prompt, negative, seed, done, total):
         planned, records = [], []
@@ -250,7 +319,6 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                 records.append({**part.record(), "status": "outside_missing_region_or_too_small"})
                 continue
             planned.append((target.area, part, mask, target.box))
-        # Broad context first, small eye/mouth/object-detail regions last.
         for index, (_area, part, mask, box) in enumerate(sorted(planned, key=lambda item: item[0], reverse=True)):
             local_prompt = (f"A realistic {part.name} of the same {self.evidence.label}, matching the original "
                             "reference detail, seamlessly integrated with the surrounding photograph. " + prompt)
@@ -258,7 +326,6 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                                     seed + 100 + index, target_masks=(mask,))
             request.strength = 0.75
             replacement = self._call(request, done, total, f"Reconstructing {part.name} from {part.source.name}")
-            # Feather inward only. Never change an observed pixel outside the allowed mask.
             blend = ImageChops.multiply(mask.filter(ImageFilter.GaussianBlur(3)), mask)
             image = Image.composite(replacement, image, blend)
             records.append({**part.record(), "target_box": box, "status": "regionally_conditioned",

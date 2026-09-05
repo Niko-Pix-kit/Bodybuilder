@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import threading
 import traceback
+from pathlib import Path
 
 from PyQt6.QtCore import QThread, QUrl, pyqtSlot
 from PyQt6.QtGui import QDesktopServices
@@ -125,9 +126,29 @@ class MainWindow(PhotoWindow):
         if not busy:
             self._workflow_changed()
 
+    @pyqtSlot(str)
+    def _add_result(self, path):
+        super()._add_result(path)
+        if Path(path).stem.endswith("__needs_review"):
+            item = self.results.item(self.results.count() - 1)
+            item.setText(Path(path).name + " [framing needs review]")
+            item.setToolTip("The image was kept, but its complete framing was not confirmed. See the processing log.")
+            self.status.setText("Image saved with a framing warning. The remaining views will still be processed.")
+
     @pyqtSlot(object)
     def _completed(self, result):
         super()._completed(result)
+        review_paths = getattr(result, "review_paths", ())
+        if review_paths:
+            prefix = "Cancelled; partial results kept." if result.cancelled else "Completed with warnings."
+            text = (f"{prefix} {len(result.output_paths)} image(s) saved; "
+                    f"{len(review_paths)} need framing review, not confirmed complete.")
+            if result.errors:
+                text += f" {len(result.errors)} other problem(s) recorded."
+            self.status.setText(text)
+            for message in getattr(result, "review_messages", ()):
+                self.log_edit.appendPlainText("REVIEW: " + message)
+            self.details_toggle.setChecked(True)
         evidence = result.run_dir / "subject_evidence.json"
         self.evidence_button.setEnabled(evidence.is_file())
         if evidence.is_file():
