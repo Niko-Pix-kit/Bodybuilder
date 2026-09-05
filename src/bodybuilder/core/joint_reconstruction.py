@@ -39,6 +39,7 @@ from bodybuilder.core.pipeline import (
     analyze_input_folder,
     environment_report,
 )
+from bodybuilder.core.run_options import QualityMode, WorkflowMode, plan_tasks, quality_profile
 from bodybuilder.core.subject_evidence import (
     SourceView,
     build_evidence,
@@ -55,16 +56,38 @@ class EvidenceConsistencyError(BackendFatalError):
 class JointRunResult(PipelineRunResult):
     review_paths: list[str] = field(default_factory=list)
     review_messages: list[str] = field(default_factory=list)
+    restored_paths: list[str] = field(default_factory=list)
+    synthetic_paths: list[str] = field(default_factory=list)
 
 
 class JointReconstructionPipeline(ReconstructionPipeline):
-    def __init__(self, config, *, complete_subject=True, subject_hint="", **kwargs):
+    def __init__(self, config, *, complete_subject=True, subject_hint="",
+                 workflow: WorkflowMode | None = None, quality: QualityMode | None = None, **kwargs):
+        self.profile = quality_profile(quality) if quality is not None else None
+        if self.profile is not None:
+            config = self.profile.apply(config)
         super().__init__(config, **kwargs)
+        # Explicit desktop workflows count TOTAL synthetic views. Keep the older
+        # complete_subject/extra-variants API working for existing scripts.
+        self.workflow = WorkflowMode(workflow) if workflow is not None else None
         self.complete_subject = complete_subject
         self.subject_hint = subject_hint
         self.vision = SubjectVision(self.cancel_event, self._log)
         self.evidence = None
         self.backend = None
+
+    def _build_tasks(self, views):
+        if self.workflow is None:
+            return ([None] if self.complete_subject else views) + [None] * self.config.synthetic_variants
+        return plan_tasks(views, self.workflow, self.config.synthetic_variants,
+                          completions_per_source=self.config.completions_per_source)
+
+    def _quality_report(self):
+        if self.profile is not None:
+            return self.profile.report()
+        return {"mode": "custom", "working_long_edge": self.config.target_long_edge,
+                "generation_steps": self.config.inference_steps, "detail_steps": self.config.inference_steps,
+                "max_detail_passes": 4, "reference_limit": 16}
 
     def run(self) -> JointRunResult:
         if self.config.backend != BackendKind.SDXL:
@@ -79,7 +102,11 @@ class JointReconstructionPipeline(ReconstructionPipeline):
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         self.logger.addHandler(handler)
         result = JointRunResult(self.run_dir, self.run_dir / "run_manifest.json")
-        manifest = {"status": "running", "workflow": "whole_subject" if self.complete_subject else "joint_source_repair",
+        workflow_name = self.workflow.value if self.workflow is not None else (
+            "whole_subject" if self.complete_subject else "joint_source_repair")
+        manifest = {"status": "running", "workflow": workflow_name,
+                    "quality_profile": self._quality_report(),
+                    "output_counts": {"restored_sources": 0, "synthetic_views": 0},
                     "config": self.config.to_dict(), "environment": environment_report(),
                     "sources": [], "outputs": [], "errors": [], "warnings": [],
                     "review_required": False, "review_count": 0}
@@ -101,6 +128,13 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                 views.append(SourceView(item.path, image, observed, self.vision.detect(image)))
                 manifest["sources"].append({**item.to_dict(), "sha256": digest,
                                             "evidence_working_size": image.size})
+            tasks = self._build_tasks(views)
+            manifest["planned_outputs"] = {
+                "restored_sources": sum(view is not None for view in tasks),
+                "synthetic_views": sum(view is None for view in tasks),
+            }
+            self._log(f"Planned outputs: {manifest['planned_outputs']}. Quality: {self._quality_report()}")
+            write_json(result.manifest_path, manifest)
             hint = self.subject_hint or ("person" if self.config.subject_kind == SubjectKind.PERSON else "")
             self.evidence = build_evidence(views, self.vision, hint=hint, log=self._log)
             # Register genuine overlaps before generation, with a bounded pair budget.
@@ -126,11 +160,14 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                 models=self.config.model_settings, use_face_adapter=False, log=self._log)
             self.callbacks.progress(0, 0, "Loading reconstruction model...")
             self.backend.prepare()
-            tasks = ([None] if self.complete_subject else views) + [None] * self.config.synthetic_variants
+            # The evidence and model are shared by both output types. Generated
+            # source restorations are never appended to the original references.
             synthetic_index = 0
             for index, view in enumerate(tasks):
                 self._check_cancelled()
-                label = f"Reconstruction {index + 1}/{len(tasks)}"
+                task_name = (f"Synthetic view {synthetic_index + 1}" if view is None
+                             else f"Restore source {view.path.name}")
+                label = f"{task_name} ({index + 1}/{len(tasks)})"
                 self.callbacks.progress(index, len(tasks), label)
                 for semantic_attempt in range(2):
                     try:
@@ -150,6 +187,12 @@ class JointReconstructionPipeline(ReconstructionPipeline):
                         manifest["warnings"].append(message)
                     manifest["review_required"] = True
                     manifest["review_count"] = len(result.review_paths)
+                if view is None:
+                    result.synthetic_paths.append(record["image"])
+                else:
+                    result.restored_paths.append(record["image"])
+                manifest["output_counts"] = {"restored_sources": len(result.restored_paths),
+                                             "synthetic_views": len(result.synthetic_paths)}
                 self._record_output(record, result, manifest)
             if not result.output_paths:
                 raise BackendFatalError("No subject reconstruction was produced")
@@ -206,7 +249,8 @@ class JointReconstructionPipeline(ReconstructionPipeline):
         return assess_framing((region.box for region in regions), image.size)
 
     def _reconstruct_view(self, view, synthetic_index, done, total, semantic_attempt=0):
-        references, reference_records = self.evidence.references()
+        limit = self.profile.reference_limit if self.profile is not None else 16
+        references, reference_records = self.evidence.references(limit=limit)
         synthetic = view is None
         seed = self._seed_for(1, done + 1, 1) + 1000 * semantic_attempt
         recovered = []
@@ -288,10 +332,14 @@ class JointReconstructionPipeline(ReconstructionPipeline):
             if any(re.search(r"\b(sunglasses|goggles|eyeglasses|spectacles)\b", text) for text in labels):
                 raise EvidenceConsistencyError("Eyewear was generated despite visible eye references without it")
         output_slug = slug + "__needs_review" if warnings else slug
+        if self.config.upscale_2x:
+            self.callbacks.progress(done, total, "Enhancing output 2x while protecting observed details...")
         return self._save_output(image=final, source_canvas=canvas.image,
             observed_mask=canvas.observed_mask, generated_mask=canvas.generated_mask,
             output_base=self.run_dir / "images" / output_slug,
             metadata={"kind": "whole_subject" if synthetic else "joint_source_repair",
+                      "source_file": str(view.path) if view is not None else None,
+                      "quality_profile": self._quality_report(),
                       "fully_synthetic": synthetic, "seed": seed, "semantic_attempt": semantic_attempt + 1,
                       "prompt": prompt, "negative_prompt": negative,
                       "reference_evidence": reference_records, "parts_applied": details,
@@ -304,7 +352,8 @@ class JointReconstructionPipeline(ReconstructionPipeline):
 
     def _refine_parts(self, image, allowed_mask, prompt, negative, seed, done, total):
         planned, records = [], []
-        for part in self.evidence.parts[:4]:
+        max_passes = self.profile.max_detail_passes if self.profile is not None else 4
+        for part in self.evidence.parts[:max_passes]:
             self._check_cancelled()
             self.callbacks.progress(done, total, f"Matching complementary part: {part.name}")
             targets = self.vision.locate(image, part.name)
@@ -325,6 +374,8 @@ class JointReconstructionPipeline(ReconstructionPipeline):
             request = self._request(image, mask, (part.image,), local_prompt, negative,
                                     seed + 100 + index, target_masks=(mask,))
             request.strength = 0.75
+            if self.profile is not None:
+                request.steps = self.profile.detail_steps
             replacement = self._call(request, done, total, f"Reconstructing {part.name} from {part.source.name}")
             blend = ImageChops.multiply(mask.filter(ImageFilter.GaussianBlur(3)), mask)
             image = Image.composite(replacement, image, blend)
