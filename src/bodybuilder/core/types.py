@@ -1,4 +1,4 @@
-"""Shared immutable data types."""
+"""Shared data contracts; reference photographs remain separate images."""
 
 from __future__ import annotations
 
@@ -35,19 +35,9 @@ class ImageAnalysis:
     warnings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "path": str(self.path),
-            "width": self.width,
-            "height": self.height,
-            "file_size": self.file_size,
-            "blur_score": round(self.blur_score, 6),
-            "exposure_score": round(self.exposure_score, 6),
-            "detail_score": round(self.detail_score, 6),
-            "resolution_score": round(self.resolution_score, 6),
-            "quality_score": round(self.quality_score, 6),
-            "faces": [face.to_dict() for face in self.faces],
-            "warnings": list(self.warnings),
-        }
+        data = asdict(self)
+        data["path"] = str(self.path)
+        return data
 
 
 @dataclass(slots=True)
@@ -66,6 +56,7 @@ class GenerationRequest:
     width: int
     height: int
     fully_synthetic: bool = False
+    reference_images: tuple[Image.Image, ...] = ()
 
 
 @dataclass(slots=True)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bodybuilder-reconstruction"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local, provenance-aware reconstruction of cropped and fragmented photographs"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -25,11 +25,7 @@ ai = [
   "torch>=2.3",
   "transformers>=4.44",
 ]
-dev = [
-  "pytest>=8.3",
-  "pytest-cov>=5",
-  "ruff>=0.8",
-]
+dev = ["pytest>=8.3", "pytest-cov>=5", "ruff>=0.8"]
 
 [project.scripts]
 bodybuilder = "bodybuilder.app:main"

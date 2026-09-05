@@ -1,32 +1,13 @@
 # Fidelity and limitations
 
-## What can be recovered
+Observed pixels are preserved at the working canvas resolution, not necessarily at native source resolution. Missing regions and new poses are generated hypotheses. The program has no identity database and does not verify the person's identity.
 
-Pixels visible in an input photograph can be retained, geometrically aligned, and resampled. When two fragments genuinely overlap, feature matching may recover their relative placement. Those operations are evidence-based.
+Do not expect a complete face detector to recognize every fragment. Person mode is the default even if no complete face is detected. Source conditioning is mandatory and each selected image is encoded individually without a destructive center crop. A maximum of 16 references is selected per source, with the source itself always included; exact reference paths are recorded.
 
-## What cannot be recovered
+Geometric overlap stitching is off by default because different poses are not one planar photograph. Explicit stitching remains available through the Python configuration. No multi-view 3D reconstruction or physical anatomy constraints are implemented. Text-guided synthetic poses are approximate.
 
-Content never captured by any source image has no unique correct answer. A model can only generate a plausible hypothesis. A hidden ear, hand, logo, garment section, rear view, or full body inferred from a face crop is not a recovered fact.
+Transparent pixels and explicit `photo.ext.mask.png` sidecars define missing content. Opaque occlusion cannot be distinguished reliably from real content by color alone; mark the region manually. Do not mark genuine evidence merely to obtain a more attractive result.
 
-BodyBuilder therefore distinguishes:
+A successful technical check only establishes that the model returned a non-degenerate image. It does not establish that generated facial features, anatomy or object details are correct. Uniform real backgrounds may be rejected by the conservative invalid-output check. Runtime errors, missing models and memory shortages are displayed and logged, not converted to successful blank output.
 
-- **source completion**, where visible pixels are preserved and only the masked region is generated;
-- **synthetic variants**, where the complete frame is generated from references and prompts.
-
-## Identity and object consistency
-
-IP-Adapter conditioning, all-fragment reference boards, and face-focused reference boards reduce drift but cannot guarantee identity. Consistency normally improves when the input set contains sharp, well-lit views from several angles. Conflicting ages, clothing, lighting, or subjects produce ambiguous evidence.
-
-Automatic face detection is only a crop-selection aid. It is not face recognition and does not establish that two photographs depict the same person.
-
-## Enhancement
-
-Swin2SR may synthesize plausible high-frequency detail. BodyBuilder applies it to the generated frame but then restores observed areas from deterministic Lanczos resampling. Consequently, real source areas are not neural-enhanced. This is intentionally conservative.
-
-## Geometric stitching
-
-Stitching requires repeated visual features. Separate photographs of a forehead and a shoe have no geometric overlap and cannot be stitched by homography; they are used only as conditioning references. Perspective change, articulation, motion, smooth surfaces, or heavy blur can cause a candidate to be rejected.
-
-## Practical validation
-
-Use multiple seeds, compare results, and reject unstable details. Keep masks and sidecars. Never use a generated completion as forensic, medical, legal, biometric, or documentary evidence.
+Optional 2x enhancement keeps observed details deterministic through Lanczos restoration and may alter/generated details elsewhere. It is not a way to recover unknown high-frequency facial information. Source files are never overwritten.

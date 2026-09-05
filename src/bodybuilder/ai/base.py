@@ -1,4 +1,4 @@
-"""Generation backend contracts and deterministic classical fallback."""
+"""Backend contracts and an explicitly non-generative developer preview."""
 
 from __future__ import annotations
 
@@ -16,11 +16,11 @@ ProgressCallback = Callable[[int, int, str], None]
 
 
 class GenerationCancelled(RuntimeError):
-    """Raised when a generation is cancelled."""
+    """The user cancelled generation."""
 
 
 class BackendFatalError(RuntimeError):
-    """Raised when the selected generation backend cannot continue."""
+    """The backend cannot continue safely."""
 
 
 class GenerationBackend(ABC):
@@ -28,45 +28,34 @@ class GenerationBackend(ABC):
     model_identifier = "unknown"
 
     def prepare(self) -> None:
-        """Load expensive resources before the first generation."""
+        """Optional resource acquisition for stateful backends."""
+        return None
 
     @abstractmethod
-    def generate(
-        self,
-        request: GenerationRequest,
-        *,
-        cancel_event: threading.Event,
-        progress: ProgressCallback | None = None,
-    ) -> Image.Image:
+    def generate(self, request: GenerationRequest, *, cancel_event: threading.Event,
+                 progress: ProgressCallback | None = None) -> Image.Image:
         raise NotImplementedError
 
     def close(self) -> None:
-        """Release expensive resources."""
+        """Optional cleanup for stateful backends."""
+        return None
 
 
 class ClassicalFillBackend(GenerationBackend):
-    """Fast diagnostic fill; not a substitute for generative reconstruction."""
+    """Developer diagnostics only; never a fallback for failed AI generation."""
 
-    name = "OpenCV classical preview"
+    name = "OpenCV diagnostic fill (not reconstruction)"
     model_identifier = "opencv-telea"
 
-    def generate(
-        self,
-        request: GenerationRequest,
-        *,
-        cancel_event: threading.Event,
-        progress: ProgressCallback | None = None,
-    ) -> Image.Image:
+    def generate(self, request: GenerationRequest, *, cancel_event: threading.Event,
+                 progress: ProgressCallback | None = None) -> Image.Image:
         if cancel_event.is_set():
-            raise GenerationCancelled("Generation cancelled")
-        if progress:
-            progress(0, 1, "Applying classical preview fill")
-        rgb = np.asarray(request.canvas.convert("RGB"))
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        mask = np.asarray(request.generated_mask.convert("L"))
-        filled = cv2.inpaint(bgr, (mask > 127).astype(np.uint8) * 255, 5, cv2.INPAINT_TELEA)
+            raise GenerationCancelled("Cancelled")
+        mask = (np.asarray(request.generated_mask.convert("L")) > 127).astype(np.uint8) * 255
+        pixels = cv2.cvtColor(np.asarray(request.canvas.convert("RGB")), cv2.COLOR_RGB2BGR)
+        filled = cv2.inpaint(pixels, mask, 5, cv2.INPAINT_TELEA)
         if cancel_event.is_set():
-            raise GenerationCancelled("Generation cancelled")
+            raise GenerationCancelled("Cancelled")
         if progress:
-            progress(1, 1, "Classical preview complete")
-        return Image.fromarray(cv2.cvtColor(filled, cv2.COLOR_BGR2RGB), mode="RGB")
+            progress(1, 1, "Diagnostic fill only")
+        return Image.fromarray(cv2.cvtColor(filled, cv2.COLOR_BGR2RGB))

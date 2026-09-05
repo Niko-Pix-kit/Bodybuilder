@@ -1,28 +1,13 @@
 # Architecture
 
-BodyBuilder is split into a thin PyQt6 presentation layer and testable reconstruction services.
+`ui/main_window.py` implements the folder-to-folder desktop workflow. It exposes no classical reconstruction engine. Advanced options are closed initially. `ui/mask_editor.py` writes explicit missing-area sidecars without overwriting originals. Qt work runs on a QThread; cancellation uses a thread-safe event and thread shutdown is allowed to finish cooperatively.
 
-## Layers
+`core/image_io.py` separates display decoding from evidence-aware fragment decoding. Alpha and optional missing-area masks define evidence; arbitrary black or white RGB regions are not automatically removed. Run outputs and masks are excluded from source discovery.
 
-- `bodybuilder.ui`: folder selection, settings, analysis table, previews, progress, cancellation, and detailed errors. Work runs on a `QThread`; the UI thread never performs model inference.
-- `bodybuilder.core.image_io`: recursive discovery, EXIF-safe decoding, HEIF registration, atomic PNG/JSON writes, and collision-safe run directories.
-- `bodybuilder.core.analysis`: deterministic quality metrics and local face-region detection. It does not perform identity matching.
-- `bodybuilder.core.stitching`: SIFT/AKAZE feature matching, RANSAC homography validation, canvas expansion, and non-destructive insertion of previously unobserved source pixels.
-- `bodybuilder.core.canvas`: AI canvas sizing, observed/generated masks, and exact restoration of the observed region after generation.
-- `bodybuilder.core.clustering`: optional DINOv2 grouping for folders containing unrelated subjects, with a non-neural fallback.
-- `bodybuilder.ai.sdxl`: lazy local SDXL inpainting and IP-Adapter conditioning.
-- `bodybuilder.ai.upscale`: optional Swin2SR enhancement and deterministic Lanczos fallback.
-- `bodybuilder.core.pipeline`: orchestration, manifests, provenance outputs, per-item fault isolation, and model lifetime management.
+`core/canvas.py` creates working canvases with usable SDXL dimensions. `core/pipeline.py` sends individual references to the model, restores observed working pixels, separates final images from diagnostics, and persists failure/cancellation states. It records exact source hashes, reference paths, effective generation seeds and environment versions.
 
-## Data invariants
+`ai/sdxl.py` explicitly loads the ViT-H image encoder, requires a functioning IP-Adapter, installs CPU-offload hooks only after loading adapter components, and uses VAE upcasting. Invalid numeric/empty/mask-like output is detected before export. A single full-precision retry is bounded; exhausted retries are fatal. Technical checks do not measure identity fidelity.
 
-1. White in `observed_mask` means that a pixel is derived from an input photograph at the current working resolution.
-2. White in `generated_mask` means that a pixel may be synthetic. The masks are complements for normal source completions.
-3. Diffusion output is never trusted inside `observed_mask`; the source canvas is pasted back after every generation.
-4. Neural upscaling may modify the entire frame, so the observed region is pasted back again from a deterministic Lanczos resize.
-5. Fully synthetic variants contain no observed pixels and are explicitly marked as such.
-6. Every final image has sidecar masks, a comparison sheet, metadata, and a run-level manifest.
+`ai/base.py` retains classical filling for developer diagnostics only. It is not used as a fallback. `ai/upscale.py` is optional; observed areas are restored after enhancement. All broad exception handlers are application boundaries that record and propagate/display faults, not silent success paths.
 
-## Failure model
-
-A corrupt source file, a rejected overlap candidate, or one failed output is recorded and the run continues by default. Model initialization failures stop the run because subsequent outputs would fail identically. Writes use a temporary file followed by `os.replace`, so interruption cannot leave a half-written final artifact.
+The regression suite mocks model calls and does not download weights. UI tests require PyQt6 and use the offscreen Qt platform. Real-model visual validation requires a separate representative dataset and appropriate hardware.

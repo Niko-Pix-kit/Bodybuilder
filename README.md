@@ -1,176 +1,68 @@
 # BodyBuilder
 
-BodyBuilder is a local PyQt6 desktop application for completing badly cropped or fragmented photographs. It can work with people, faces, hands, limbs, animals, objects, and scenes.
+A local PyQt6 application for completing cropped photographs using other fragments of the same person or object as references. The interface and code are in English.
 
-The application deliberately separates two different operations:
+## Update and launch in an existing Python environment
 
-1. **Source completion** extends each real source photograph without letting the generative model repaint its visible region.
-2. **Synthetic variants** create new views or poses from the reference set. These are generated hypotheses and are never presented as recovered evidence.
-
-No model can recover pixels that were never captured. BodyBuilder uses the available photographs as evidence, aligns overlapping fragments when possible, and generates plausible missing content. The result can be useful, but it is not proof of what the missing area originally contained.
-
-## Main features
-
-- English PyQt6 interface.
-- Input-folder and output-folder workflow.
-- Recursive JPEG, PNG, WebP, TIFF, BMP, HEIC, and HEIF discovery with EXIF orientation handling.
-- Blur, exposure, detail, and resolution quality analysis.
-- Optional geometric stitching of overlapping fragments before AI generation.
-- Local SDXL inpainting/outpainting through Hugging Face Diffusers.
-- IP-Adapter image conditioning from a contact sheet of all fragments.
-- Person-aware reference conditioning when faces can be detected.
-- Configurable completions per source and optional pose/view variants.
-- Optional Swin2SR 2x enhancement with a conservative Lanczos fallback.
-- Exact restoration of observed pixels at the AI working resolution after diffusion generation. Inputs are resized for the AI canvas; with 2x output enabled, the observed region is deterministically resampled and is never generatively enhanced.
-- Per-image observed/generated masks, comparison sheets, seeds, and JSON manifests.
-- Background processing, cancellation, progress reporting, and crash-safe error dialogs.
-- No telemetry and no photo upload performed by BodyBuilder itself.
-
-## Installation
-
-Python 3.11 to 3.13 is required. Use the **same Python interpreter for installation and launch**. An existing virtual environment can be reused: do not recreate it. A Git pull updates source files, not the packages installed in that environment.
-
-### Full local AI installation in an existing environment
-
-Run these commands from the repository root. Here, `python` must be the interpreter selected in your IDE or existing environment:
+From your repository folder, using the Python interpreter already selected in your IDE:
 
 ```bash
+git pull --ff-only origin main
 python -m pip install -r requirements.txt
 python -m bodybuilder
 ```
 
-An environment does not need to be activated when its interpreter is called explicitly:
+No new virtual environment is needed. Python 3.11–3.13 is supported. `requirements.txt` installs the editable application and its local AI dependencies from `pyproject.toml`.
 
-```bash
-/path/to/existing/environment/bin/python -m pip install -r requirements.txt
-/path/to/existing/environment/bin/python -m bodybuilder
-```
+## Simple workflow
 
-Replace the example interpreter path with your actual environment path. On Windows, use that environment's `Scripts\python.exe` instead.
+Select **Source folder**, select **Save results to**, and click **Reconstruct**. Put only photographs of the same person or object in a source folder. Person mode, automatic device selection and one completion per source are the defaults. Analysis runs automatically. Technical options are hidden under **Advanced options**; old saved engine settings cannot silently select the non-generative preview.
 
-`requirements.txt` installs the project in editable mode with its `ai` extra. This includes PyQt6, NumPy, OpenCV, Pillow, pillow-heif, PyTorch, Diffusers, Transformers, Accelerate, and safetensors, plus their dependencies. The authoritative dependency declarations and version ranges remain in `pyproject.toml`, avoiding duplicate lists that can drift apart. These requirements files are installation entry points, not fully pinned lockfiles.
+**Cropped edges:** the application extends the canvas around the photographed portion. It does not require a detectable complete face. The default frame is portrait; frame and extension can be changed under Advanced options. A thin fragment will not create a degenerate, thin AI canvas.
 
-Install a PyTorch build appropriate for your GPU before installing the project when the default PyTorch package is not suitable for your system. Installing Python packages does not install a GPU driver. Model weights download separately on first use.
+**Missing areas inside an image:** select a source photo and click **Mark missing area in selected photo**. Paint only the part to reconstruct. Marks are saved alongside the original as `photo.jpg.mask.png` (white = missing, black = keep). The original is not overwritten. Transparent PNG regions are also treated as missing. Ordinary black/white photographic content is not automatically erased: use the marking tool for opaque obstruction or blank patches.
 
-### Updating an existing checkout
+**Additional poses/views:** optional under Advanced options. These are entirely synthetic, not restored photographs. Completing a close-up and generating a full-body view are different tasks; the application cannot infer an unseen body faithfully from one facial fragment.
 
-From the repository root, using your existing environment's interpreter:
+## Results, not masks
 
-```bash
-git fetch origin &&
-git switch main &&
-git pull --ff-only origin main &&
-python -m pip install -r requirements.txt &&
-python -m bodybuilder
-```
-
-These commands do not discard local changes. Resolve any Git error before continuing with installation.
-
-### Lightweight installation
-
-```bash
-python -m pip install -r requirements-minimal.txt
-python -m bodybuilder
-```
-
-The lightweight installation includes PyQt6 and the image-processing dependencies, but not the local AI stack. It can analyze images, create provenance assets, and test geometric overlap stitching. Choose **Classical preview (no generative AI)** in the interface and disable **Enhance final images 2x** to avoid requesting the optional AI upscaler. It cannot plausibly invent large missing body or object regions.
-
-### Missing PyQt6 or another dependency
-
-`ModuleNotFoundError: No module named 'PyQt6'` means that the interpreter launching the application cannot import PyQt6. Install the requirements with that exact interpreter, rather than an unrelated `pip` executable:
-
-```bash
-/path/to/existing/environment/bin/python -m pip install -r requirements.txt
-/path/to/existing/environment/bin/python -m pip check
-/path/to/existing/environment/bin/python -c "from PyQt6.QtWidgets import QApplication; print('PyQt6 import OK')"
-```
-
-In an IDE, select the same interpreter and run the module `bodybuilder` rather than executing `src/bodybuilder/__main__.py` as a standalone script. Editable installation registers the `src` package without requiring a custom `PYTHONPATH`.
-
-## First run
-
-The local AI backend downloads model files from Hugging Face on first use. The default stack is:
-
-- `diffusers/stable-diffusion-xl-1.0-inpainting-0.1`
-- `h94/IP-Adapter`
-- `caidas/swin2SR-classical-sr-x2-64` when 2x enhancement is enabled
-- `facebook/dinov2-small` only when automatic multi-subject grouping is requested
-
-Set `HF_HOME` to move the Hugging Face model cache:
-
-```bash
-export HF_HOME=/path/to/model-cache
-```
-
-## Recommended workflow
-
-1. Put all fragments of the same person or object in one folder.
-2. Open BodyBuilder and select that folder.
-3. Select an output folder.
-4. Leave **Treat all images as one subject** enabled unless the folder contains unrelated subjects.
-5. Click **Analyze source** and inspect the quality scores and detected face count.
-6. Run one completion per source first.
-7. Increase completion count or add synthetic variants only after checking identity consistency.
-8. Inspect the generated mask and manifest beside every output.
-
-A close-up face cannot be converted into a geometrically faithful full-body photograph while preserving the original close-up pixels. For that case, use **Synthetic variants**; BodyBuilder will mark the entire result as generated.
-
-## Output structure
-
-Each run creates a time-stamped directory:
+Each run has this structure:
 
 ```text
 BodyBuilder_YYYYMMDD_HHMMSS/
-├── run_manifest.json
-├── bodybuilder.log
-└── subject_001/
-    ├── analysis.json
-    ├── reference_board.jpg
-    ├── face_reference_board.jpg          # when faces were detected
-    ├── diagnostics/
-    │   ├── source_001_canvas.png
-    │   ├── source_001_observed_mask.png
-    │   └── source_001_generated_mask.png
-    ├── completions/
-    │   ├── source_001__completion_01.png
-    │   ├── source_001__completion_01__comparison.jpg
-    │   └── source_001__completion_01.json
-    └── variants/
-        ├── variant_01__standing_front.png
-        └── variant_01__standing_front.json
+  images/                  # completed photographs only
+  diagnostics/             # evidence masks, working canvases, per-image metadata
+  bodybuilder.log          # processing details and errors
+  run_manifest.json        # status, sources, SHA-256 hashes, versions and outputs
 ```
 
-Mask convention:
+The **Reconstructed images** tab and **Open reconstructed images** button show final images only. Black/white diagnostic masks are never shown as reconstructed photographs. Source scanning excludes explicit masks and previous run folders.
 
-- `observed_mask`: white pixels came from input photographs.
-- `generated_mask`: white pixels were synthesized or classically filled.
+The developer-only classical backend writes to `diagnostic_previews/`, not `images/`. It is not offered in the desktop reconstruction workflow and is never used as an automatic fallback.
 
-## Fidelity controls
+## AI and failure handling
 
-- **Reference fidelity** controls IP-Adapter influence. Too low can cause identity drift; too high can copy framing or create visual artifacts.
-- **Denoising strength** controls how aggressively the missing region is generated.
-- **Steps** trades speed for refinement.
-- **Completion margin** determines how far each source is extended.
-- **Stitch overlapping fragments** tries feature-based alignment before generation.
+The local backend uses SDXL inpainting and IP-Adapter Plus. Its ViT-H encoder is explicitly loaded from `h94/IP-Adapter/models/image_encoder`; the different encoder under `sdxl_models/image_encoder` is not compatible with these Plus weights. Each reference is encoded separately and padded without center-cropping away fragment edges. Up to 16 references are used per source; the source itself is always included and the exact list is recorded.
 
-The application does not perform face recognition, identify a person, or compare the subject against an external database.
+The reference adapter must load successfully. The application stops with an error rather than quietly generating without the reference photographs. Floating-point pixels are checked before image conversion. Empty, almost uniform, mask-like or unchanged generated regions are rejected, with one full-precision retry. Repeated failure does not export a blank image as success. This is a technical sanity check, not an assessment of identity accuracy. A genuinely featureless region can also trigger the conservative check; inspect the log in that case.
 
-## Development
+Models download on first use. Photos are processed locally and are not uploaded by BodyBuilder. CPU inference is supported but can be very slow. Cancellation is checked between stages and diffusion steps; an active model download/loading call cannot be interrupted immediately.
+
+## Fidelity limits
+
+Observed pixels are restored **at the AI working resolution** after generation. Inputs are resampled to fit that canvas. Optional 2x enhancement does not generatively repaint observed details: those areas are restored with deterministic Lanczos resizing. It cannot recover facial details that were never recorded. Different poses are used as references rather than automatically stitched together; geometric stitching remains an explicit programmatic option for genuine overlaps.
+
+Missing facial/body/object parts remain estimates and may be incorrect. Keep the metadata when sharing outputs. Only process photographs you are authorized to use.
+
+## Testing
 
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install -e ".[dev]"
 ruff check .
-pytest
+python -m compileall -q src tests
+QT_QPA_PLATFORM=offscreen pytest
 ```
 
-Install all AI and development dependencies with:
+Tests cover mask handling, source preservation, invalid output rejection, reference loader configuration, retry limits, file separation, manifests and the simplified UI. Model calls in regression tests are mocked: these tests do **not** demonstrate visual fidelity on real photographs. Assess that separately on representative, authorized source fragments with the actual model and hardware.
 
-```bash
-python -m pip install -r requirements.txt -r requirements-dev.txt
-```
-
-See [Architecture](docs/ARCHITECTURE.md) and [Fidelity and limitations](docs/FIDELITY_AND_LIMITATIONS.md).
-
-## Responsible use
-
-Only process photographs you are authorized to use. Do not present generated regions or synthetic variants as documentary originals. Keep the accompanying masks and manifests when results are shared or used for decisions.
+Technical references: [IP-Adapter model card](https://huggingface.co/h94/IP-Adapter), [Diffusers IP-Adapter guide](https://huggingface.co/docs/diffusers/en/using-diffusers/ip_adapter).

@@ -1,13 +1,15 @@
-"""End-to-end reconstruction pipeline with cancellation and provenance."""
+"""Reference-guided reconstruction with separate results and diagnostics."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import platform
 import threading
-import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -21,33 +23,28 @@ from bodybuilder.ai.base import (
     GenerationCancelled,
 )
 from bodybuilder.ai.sdxl import SdxlBackend
-from bodybuilder.ai.upscale import LanczosUpscaler, Swin2SRUpscaler, Upscaler
 from bodybuilder.config import BackendKind, PipelineConfig, SubjectKind
-from bodybuilder.core.analysis import analyze_paths, best_face_crops, make_reference_board
 from bodybuilder.core.canvas import (
+    PreparedCanvas,
     generated_fraction,
     prepare_outpaint_canvas,
     prepare_variant_canvas,
     preserve_observed_pixels,
 )
-from bodybuilder.core.clustering import group_images
 from bodybuilder.core.image_io import (
     ensure_unique_path,
-    load_rgb,
+    load_fragment,
     safe_stem,
     save_png,
     scan_images,
     write_json,
 )
-from bodybuilder.core.prompts import completion_prompt, variant_prompt
-from bodybuilder.core.provenance import create_comparison, save_jpeg
-from bodybuilder.core.stitching import stitch_from_anchor
 from bodybuilder.core.types import GenerationRequest, ImageAnalysis, StitchResult
-from bodybuilder.logging_utils import create_run_logger
+from bodybuilder.core.validation import mask_like, validate_generation
 
 
 class PipelineCancelled(RuntimeError):
-    """Raised when the user cancels the active run."""
+    """Cancellation at an application checkpoint."""
 
 
 @dataclass(slots=True)
@@ -73,627 +70,316 @@ class PipelineRunResult:
     cancelled: bool = False
 
 
-def analyze_input_folder(
-    config: PipelineConfig,
-    *,
-    callbacks: PipelineCallbacks | None = None,
-    cancel_event: threading.Event | None = None,
-) -> AnalysisRunResult:
+def analyze_input_folder(config: PipelineConfig, *, callbacks: PipelineCallbacks | None = None,
+                         cancel_event: threading.Event | None = None) -> AnalysisRunResult:
+    from bodybuilder.core.analysis import analyze_paths
+
     callbacks = callbacks or PipelineCallbacks()
     cancel_event = cancel_event or threading.Event()
     paths = scan_images(config.input_dir, recursive=config.recursive_scan)
     if not paths:
-        raise RuntimeError("No supported image files were found in the selected input folder")
-
-    analyses, failures = analyze_paths(
-        paths,
-        progress=callbacks.progress,
-        cancelled=cancel_event.is_set,
-    )
-    for item in analyses:
-        callbacks.analysis_item(item)
+        raise ValueError("No source photographs found. Mask files and previous output folders are excluded.")
+    analyses, failures = analyze_paths(paths, progress=callbacks.progress, cancelled=cancel_event.is_set)
+    usable = []
+    for analysis in analyses:
+        if cancel_event.is_set():
+            raise PipelineCancelled("Analysis cancelled")
+        image, _mask = load_fragment(analysis.path)
+        if mask_like(image):
+            failures.append({"path": str(analysis.path), "error": "Black/white mask or empty image, not a photograph"})
+        else:
+            usable.append(analysis)
+            callbacks.analysis_item(analysis)
     for failure in failures:
-        callbacks.log(
-            f"Could not decode {failure.get('path', 'unknown file')}: "
-            f"{failure.get('error', 'unknown error')}"
-        )
+        callbacks.log(f"Skipped {failure['path']}: {failure['error']}")
     if cancel_event.is_set():
         raise PipelineCancelled("Analysis cancelled")
-    if not analyses:
-        raise RuntimeError("Every discovered image failed to decode")
-    return AnalysisRunResult(analyses=analyses, failures=failures)
+    if not usable:
+        raise ValueError("No usable photographs remain. Select the original fragments, not the diagnostic masks.")
+    return AnalysisRunResult(usable, failures)
+
+
+def environment_report() -> dict[str, Any]:
+    packages = {}
+    for package in ("PyQt6", "Pillow", "numpy", "torch", "diffusers", "transformers", "accelerate"):
+        try:
+            packages[package] = version(package)
+        except PackageNotFoundError:
+            packages[package] = "not installed"
+    return {"python": platform.python_version(), "platform": platform.system(), "packages": packages}
 
 
 class ReconstructionPipeline:
-    def __init__(
-        self,
-        config: PipelineConfig,
-        *,
-        callbacks: PipelineCallbacks | None = None,
-        cancel_event: threading.Event | None = None,
-    ) -> None:
+    def __init__(self, config: PipelineConfig, *, callbacks: PipelineCallbacks | None = None,
+                 cancel_event: threading.Event | None = None) -> None:
         self.config = config
         self.callbacks = callbacks or PipelineCallbacks()
         self.cancel_event = cancel_event or threading.Event()
         self.run_dir: Path | None = None
         self.logger: logging.Logger | None = None
         self._backends: dict[tuple[SubjectKind, bool], GenerationBackend] = {}
-        self._upscaler: Upscaler | None = None
-        self._upscaler_failed = False
+        self._upscaler: Any = None
 
     def run(self) -> PipelineRunResult:
         self._validate_paths()
-        self.run_dir = self._create_run_directory()
-        self.logger = create_run_logger(self.run_dir / "bodybuilder.log")
-        started_at = datetime.now().astimezone()
-        manifest_path = self.run_dir / "run_manifest.json"
-        result = PipelineRunResult(run_dir=self.run_dir, manifest_path=manifest_path)
+        name = safe_stem(self.config.run_name) if self.config.run_name else datetime.now().strftime("BodyBuilder_%Y%m%d_%H%M%S")
+        self.run_dir = ensure_unique_path(self.config.output_dir / name)
+        self.run_dir.mkdir(parents=True)
+        self.logger = logging.getLogger(f"bodybuilder.run.{self.run_dir.name}.{id(self)}")
+        self.logger.setLevel(logging.INFO)
+        handler = logging.FileHandler(self.run_dir / "bodybuilder.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        self.logger.addHandler(handler)
+        result = PipelineRunResult(self.run_dir, self.run_dir / "run_manifest.json")
         manifest: dict[str, Any] = {
-            "application": "BodyBuilder",
-            "version": __version__,
-            "started_at": started_at.isoformat(),
-            "status": "running",
-            "truth_notice": (
-                "Missing pixels are generated hypotheses. Source completions preserve observed pixels; "
-                "synthetic variants are entirely generated."
-            ),
-            "config": self.config.to_dict(),
-            "subjects": [],
-            "outputs": [],
-            "warnings": [],
-            "errors": [],
+            "version": __version__, "status": "running", "config": self.config.to_dict(),
+            "environment": environment_report(), "sources": [], "outputs": [], "errors": [],
+            "notice": "Missing regions are generated estimates, not recovered evidence.",
         }
-        write_json(manifest_path, manifest)
-        self._log(f"Run directory: {self.run_dir}")
-
         try:
-            paths = scan_images(self.config.input_dir, recursive=self.config.recursive_scan)
-            if not paths:
-                raise RuntimeError("No supported image files were found in the selected input folder")
-            self._log(f"Discovered {len(paths)} supported image file(s).")
-
-            analyses, analysis_failures = analyze_paths(
-                paths,
-                progress=self.callbacks.progress,
-                cancelled=self.cancel_event.is_set,
-            )
-            for analysis in analyses:
-                self.callbacks.analysis_item(analysis)
-            for failure in analysis_failures:
-                error = {"stage": "analysis", **failure}
-                manifest["errors"].append(error)
-                result.errors.append(error)
-            self._check_cancelled()
-            if not analyses:
-                raise RuntimeError("Every discovered image failed to decode")
-
-            models = self.config.model_settings
-            grouping = group_images(
-                analyses,
-                group_all=self.config.group_all_images,
-                threshold=self.config.grouping_similarity_threshold,
-                model_id=models.grouping_model_id,
-                device=self.config.device,
-                log=self._log,
-            )
-            if grouping.warning:
-                manifest["warnings"].append(grouping.warning)
-
-            variant_count = self.config.synthetic_variants
-            if self.config.backend == BackendKind.CLASSICAL and variant_count:
-                warning = (
-                    "Synthetic variants were skipped because the classical backend cannot create "
-                    "new poses or views."
-                )
-                self._log(warning)
-                manifest["warnings"].append(warning)
-                variant_count = 0
-
-            total_generation_tasks = sum(
-                len(group) * self.config.completions_per_source + variant_count
-                for group in grouping.groups
-            )
-            completed_generation_tasks = 0
-
-            for subject_index, group in enumerate(grouping.groups, start=1):
+            write_json(result.manifest_path, manifest)
+            self._log(f"Run folder: {self.run_dir}")
+            analysis_result = analyze_input_folder(self.config, callbacks=self.callbacks, cancel_event=self.cancel_event)
+            result.errors.extend(analysis_result.failures)
+            manifest["errors"].extend(analysis_result.failures)
+            for item in analysis_result.analyses:
+                with item.path.open("rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+                manifest["sources"].append({**item.to_dict(), "sha256": digest})
+            groups = self._groups(analysis_result.analyses)
+            variants = self.config.synthetic_variants if self.config.backend == BackendKind.SDXL else 0
+            total = sum(len(group) * self.config.completions_per_source + variants for group in groups)
+            done = 0
+            for group_index, group in enumerate(groups, 1):
                 self._check_cancelled()
-                subject_folder = self.run_dir / f"subject_{subject_index:03d}"
-                subject_folder.mkdir(parents=True, exist_ok=True)
-                subject_kind = self._resolve_subject_kind(group)
-                self._log(
-                    f"Subject {subject_index}: {len(group)} image(s), resolved type "
-                    f"{subject_kind.value}."
-                )
-
-                sorted_group = sorted(group, key=lambda item: item.quality_score, reverse=True)
-                reference_images = [load_rgb(item.path) for item in sorted_group[:16]]
-                reference_board = make_reference_board(
-                    reference_images,
-                    title="All source references",
-                )
-                save_jpeg(reference_board, subject_folder / "reference_board.jpg", quality=94)
-
-                face_crops = best_face_crops(sorted_group)
-                face_board: Image.Image | None = None
-                if face_crops:
-                    face_board = make_reference_board(
-                        face_crops,
-                        max_images=8,
-                        title="Detected face references",
-                    )
-                    save_jpeg(face_board, subject_folder / "face_reference_board.jpg", quality=94)
-
-                subject_manifest: dict[str, Any] = {
-                    "subject_index": subject_index,
-                    "resolved_kind": subject_kind.value,
-                    "source_count": len(group),
-                    "face_reference_count": len(face_crops),
-                    "sources": [item.to_dict() for item in group],
-                    "outputs": [],
-                }
-                manifest["subjects"].append(subject_manifest)
-                write_json(subject_folder / "analysis.json", subject_manifest)
-                write_json(manifest_path, manifest)
-
-                backend = self._backend_for(
-                    subject_kind,
-                    use_face_adapter=face_board is not None,
-                )
+                subject = self._resolve_subject_kind(group)
+                backend = self._backend_for(subject, use_face_adapter=False)
+                self.callbacks.progress(0, 0, "Loading AI and reference model...")
                 backend.prepare()
-                diagnostics_dir = subject_folder / "diagnostics"
-                completions_dir = subject_folder / "completions"
-                variants_dir = subject_folder / "variants"
-
-                for source_index, analysis in enumerate(group, start=1):
+                self._check_cancelled()
+                ordered = sorted(group, key=lambda item: item.quality_score, reverse=True)
+                for source_index, analysis in enumerate(group, 1):
                     self._check_cancelled()
-                    source_slug = f"source_{source_index:03d}_{safe_stem(analysis.path.stem)}"
                     try:
-                        stitched = self._prepare_observed_source(analysis, group)
-                        canvas = prepare_outpaint_canvas(
-                            stitched.image,
-                            stitched.observed_mask,
+                        observed = self._prepare_observed_source(analysis, group)
+                        canvas = prepare_outpaint_canvas(observed.image, observed.observed_mask,
                             aspect=self.config.completion_aspect,
                             margin_percent=self.config.completion_margin_percent,
-                            target_long_edge=self.config.target_long_edge,
-                        )
-                        save_png(canvas.image, diagnostics_dir / f"{source_slug}_canvas.png")
-                        save_png(
-                            canvas.observed_mask,
-                            diagnostics_dir / f"{source_slug}_observed_mask.png",
-                        )
-                        save_png(
-                            canvas.generated_mask,
-                            diagnostics_dir / f"{source_slug}_generated_mask.png",
-                        )
-
-                        prompt, negative_prompt = completion_prompt(
-                            subject_kind,
-                            self.config.custom_prompt,
-                        )
-                        for completion_index in range(1, self.config.completions_per_source + 1):
-                            self._check_cancelled()
-                            seed = self._seed_for(subject_index, source_index, completion_index)
-                            task_label = (
-                                f"Subject {subject_index}, source {source_index}, "
-                                f"completion {completion_index}"
-                            )
-                            self.callbacks.progress(
-                                completed_generation_tasks,
-                                max(1, total_generation_tasks),
-                                task_label,
-                            )
-                            request = GenerationRequest(
-                                canvas=canvas.image,
-                                generated_mask=canvas.generated_mask,
-                                reference_board=reference_board,
-                                face_reference_board=face_board,
-                                prompt=prompt,
-                                negative_prompt=negative_prompt,
-                                seed=seed,
-                                steps=self.config.inference_steps,
-                                guidance_scale=self.config.guidance_scale,
-                                strength=self.config.denoising_strength,
-                                reference_fidelity=self.config.reference_fidelity,
-                                width=canvas.image.width,
-                                height=canvas.image.height,
-                                fully_synthetic=False,
-                            )
-                            generated = backend.generate(
-                                request,
-                                cancel_event=self.cancel_event,
-                                progress=lambda step, steps, message, current=completed_generation_tasks, label=task_label: self.callbacks.progress(
-                                    current,
-                                    max(1, total_generation_tasks),
-                                    f"{label}: {message} {step}/{steps}",
-                                ),
-                            )
-                            reconstructed = preserve_observed_pixels(
-                                generated,
-                                canvas.image,
-                                canvas.generated_mask,
-                            )
-                            output_base = (
-                                completions_dir
-                                / f"{source_slug}__completion_{completion_index:02d}"
-                            )
-                            output_record = self._save_output(
-                                image=reconstructed,
-                                source_canvas=canvas.image,
-                                observed_mask=canvas.observed_mask,
-                                generated_mask=canvas.generated_mask,
-                                output_base=output_base,
-                                metadata={
-                                    "kind": "source_completion",
-                                    "subject_index": subject_index,
-                                    "source_index": source_index,
-                                    "source_file": str(analysis.path),
-                                    "source_files_used": [str(path) for path in stitched.used_paths],
-                                    "source_files_rejected_for_stitching": [
-                                        str(path) for path in stitched.rejected_paths
-                                    ],
-                                    "seed": seed,
-                                    "prompt": prompt,
-                                    "negative_prompt": negative_prompt,
-                                    "backend": backend.name,
-                                    "model": backend.model_identifier,
-                                    "observed_working_pixels_preserved_after_diffusion": True,
-                                    "source_resampled_for_ai_canvas": stitched.image.size
-                                    != (canvas.placement.source_width, canvas.placement.source_height),
-                                    "observed_input_width": stitched.image.width,
-                                    "observed_input_height": stitched.image.height,
-                                    "fully_synthetic": False,
-                                    "placement": canvas.placement.to_dict(),
-                                    "generated_fraction": round(
-                                        generated_fraction(canvas.generated_mask), 6
-                                    ),
-                                },
-                            )
-                            completed_generation_tasks += 1
-                            result.output_paths.append(Path(output_record["image"]))
-                            manifest["outputs"].append(output_record)
-                            subject_manifest["outputs"].append(output_record)
-                            write_json(subject_folder / "analysis.json", subject_manifest)
-                            write_json(manifest_path, manifest)
-                    except (BackendFatalError, GenerationCancelled, PipelineCancelled):
+                            target_long_edge=self.config.target_long_edge)
+                        references, reference_paths = self._references(analysis, ordered)
+                        prompt, negative = self._prompts(subject, False, 0)
+                        for index in range(1, self.config.completions_per_source + 1):
+                            label = f"Photo {source_index}/{len(group)}"
+                            record = self._generate(backend, canvas, references, prompt, negative,
+                                f"subject_{group_index:03d}__{source_index:03d}_{safe_stem(analysis.path.stem)}__{index:02d}",
+                                self._seed_for(group_index, source_index, index), done, total, label,
+                                {"kind": "source_completion", "source_file": str(analysis.path),
+                                 "reference_files": reference_paths, "source_files_used": [str(p) for p in observed.used_paths],
+                                 "fully_synthetic": False, "placement": canvas.placement.to_dict()})
+                            done += 1
+                            self._record_output(record, result, manifest)
+                    except (GenerationCancelled, PipelineCancelled, BackendFatalError):
                         raise
-                    except Exception as exc:
-                        error = self._record_error(
-                            manifest,
-                            result,
-                            stage="source_completion",
-                            subject_index=subject_index,
-                            source=str(analysis.path),
-                            exc=exc,
-                        )
-                        subject_manifest.setdefault("errors", []).append(error)
-                        write_json(subject_folder / "analysis.json", subject_manifest)
-                        write_json(manifest_path, manifest)
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        self._record_error(exc, result, manifest, str(analysis.path))
                         if not self.config.continue_on_error:
                             raise
-
-                for variant_index in range(variant_count):
+                for index in range(variants):
                     self._check_cancelled()
-                    try:
-                        slug, prompt, negative_prompt = variant_prompt(
-                            subject_kind,
-                            variant_index,
-                            self.config.variant_frame,
-                            self.config.custom_prompt,
-                        )
-                        variant_canvas = prepare_variant_canvas(
-                            frame=self.config.variant_frame,
-                            target_long_edge=self.config.target_long_edge,
-                        )
-                        seed = self._seed_for(subject_index, 10_000, variant_index + 1)
-                        task_label = (
-                            f"Subject {subject_index}, synthetic variant {variant_index + 1}"
-                        )
-                        self.callbacks.progress(
-                            completed_generation_tasks,
-                            max(1, total_generation_tasks),
-                            task_label,
-                        )
-                        request = GenerationRequest(
-                            canvas=variant_canvas.image,
-                            generated_mask=variant_canvas.generated_mask,
-                            reference_board=reference_board,
-                            face_reference_board=face_board,
-                            prompt=prompt,
-                            negative_prompt=negative_prompt,
-                            seed=seed,
-                            steps=self.config.inference_steps,
-                            guidance_scale=self.config.guidance_scale,
-                            strength=1.0,
-                            reference_fidelity=self.config.reference_fidelity,
-                            width=variant_canvas.image.width,
-                            height=variant_canvas.image.height,
-                            fully_synthetic=True,
-                        )
-                        generated = backend.generate(
-                            request,
-                            cancel_event=self.cancel_event,
-                            progress=lambda step, steps, message, current=completed_generation_tasks, label=task_label: self.callbacks.progress(
-                                current,
-                                max(1, total_generation_tasks),
-                                f"{label}: {message} {step}/{steps}",
-                            ),
-                        )
-                        output_base = variants_dir / f"variant_{variant_index + 1:03d}_{slug}"
-                        output_record = self._save_output(
-                            image=generated,
-                            source_canvas=variant_canvas.image,
-                            observed_mask=variant_canvas.observed_mask,
-                            generated_mask=variant_canvas.generated_mask,
-                            output_base=output_base,
-                            metadata={
-                                "kind": "synthetic_variant",
-                                "subject_index": subject_index,
-                                "seed": seed,
-                                "prompt": prompt,
-                                "negative_prompt": negative_prompt,
-                                "backend": backend.name,
-                                "model": backend.model_identifier,
-                                "observed_pixels_preserved": False,
-                                "fully_synthetic": True,
-                                "generated_fraction": 1.0,
-                            },
-                        )
-                        completed_generation_tasks += 1
-                        result.output_paths.append(Path(output_record["image"]))
-                        manifest["outputs"].append(output_record)
-                        subject_manifest["outputs"].append(output_record)
-                        write_json(subject_folder / "analysis.json", subject_manifest)
-                        write_json(manifest_path, manifest)
-                    except (BackendFatalError, GenerationCancelled, PipelineCancelled):
-                        raise
-                    except Exception as exc:
-                        error = self._record_error(
-                            manifest,
-                            result,
-                            stage="synthetic_variant",
-                            subject_index=subject_index,
-                            variant_index=variant_index + 1,
-                            exc=exc,
-                        )
-                        subject_manifest.setdefault("errors", []).append(error)
-                        write_json(subject_folder / "analysis.json", subject_manifest)
-                        write_json(manifest_path, manifest)
-                        if not self.config.continue_on_error:
-                            raise
-
-            manifest["status"] = "completed_with_errors" if manifest["errors"] else "completed"
-            manifest["completed_at"] = datetime.now().astimezone().isoformat()
-            self.callbacks.progress(
-                max(1, total_generation_tasks),
-                max(1, total_generation_tasks),
-                "Reconstruction complete",
-            )
+                    references, reference_paths = self._references(ordered[0], ordered)
+                    canvas = prepare_variant_canvas(frame=self.config.variant_frame, target_long_edge=self.config.target_long_edge)
+                    prompt, negative = self._prompts(subject, True, index)
+                    record = self._generate(backend, canvas, references, prompt, negative,
+                        f"subject_{group_index:03d}__synthetic_{index + 1:02d}",
+                        self._seed_for(group_index, 10000, index), done, total, "Synthetic view",
+                        {"kind": "synthetic_variant", "reference_files": reference_paths, "fully_synthetic": True})
+                    done += 1
+                    self._record_output(record, result, manifest)
+            if not result.output_paths:
+                raise BackendFatalError("No reconstruction was produced. Diagnostics are not result images. See bodybuilder.log.")
+            manifest["status"] = "completed_with_errors" if result.errors else "completed"
+            self.callbacks.progress(total, total, f"Saved {len(result.output_paths)} image(s)")
         except (PipelineCancelled, GenerationCancelled):
             result.cancelled = True
             manifest["status"] = "cancelled"
-            manifest["completed_at"] = datetime.now().astimezone().isoformat()
-            self._log("Run cancelled by the user.", level=logging.WARNING)
+            self._log("Cancelled. Completed images have been kept.")
         except Exception as exc:
-            self._record_error(manifest, result, stage="run", exc=exc)
+            # Application boundary: record unexpected programming faults and re-raise.
             manifest["status"] = "failed"
-            manifest["completed_at"] = datetime.now().astimezone().isoformat()
-            write_json(manifest_path, manifest)
+            self._record_error(exc, result, manifest, "run")
             raise
         finally:
             for backend in self._backends.values():
-                backend.close()
+                try:
+                    backend.close()
+                except (RuntimeError, OSError) as exc:
+                    self._log(f"Backend cleanup failed: {exc}")
             if self._upscaler is not None:
-                self._upscaler.close()
-            write_json(manifest_path, manifest)
+                try:
+                    self._upscaler.close()
+                except (RuntimeError, OSError) as exc:
+                    self._log(f"Upscaler cleanup failed: {exc}")
+            manifest["finished_at"] = datetime.now().astimezone().isoformat()
+            try:
+                write_json(result.manifest_path, manifest)
+            finally:
+                self.logger.removeHandler(handler)
+                handler.close()
         return result
 
-    def _prepare_observed_source(
-        self,
-        analysis: ImageAnalysis,
-        group: list[ImageAnalysis],
-    ) -> StitchResult:
-        if not self.config.stitch_overlaps or self.config.max_stitch_candidates == 0:
-            image = load_rgb(analysis.path)
-            return StitchResult(
-                image=image,
-                observed_mask=Image.new("L", image.size, 255),
-                used_paths=[analysis.path],
-            )
-        candidates = sorted(
-            (item for item in group if item.path != analysis.path),
-            key=lambda item: item.quality_score,
-            reverse=True,
-        )
-        return stitch_from_anchor(
-            analysis.path,
-            [item.path for item in candidates],
-            max_candidates=self.config.max_stitch_candidates,
-            log=self._log,
-        )
+    def _groups(self, analyses: list[ImageAnalysis]) -> list[list[ImageAnalysis]]:
+        if self.config.group_all_images:
+            return [analyses]
+        from bodybuilder.core.clustering import group_images
+        grouped = group_images(analyses, group_all=False, threshold=self.config.grouping_similarity_threshold,
+            model_id=self.config.model_settings.grouping_model_id, device=self.config.device, log=self._log)
+        if grouped.warning:
+            self._log(grouped.warning)
+        return grouped.groups
 
-    def _save_output(
-        self,
-        *,
-        image: Image.Image,
-        source_canvas: Image.Image,
-        observed_mask: Image.Image,
-        generated_mask: Image.Image,
-        output_base: Path,
-        metadata: dict[str, Any],
-    ) -> dict[str, Any]:
-        final_image = image.convert("RGB")
-        final_source = source_canvas.convert("RGB")
-        final_observed = observed_mask.convert("L")
-        final_generated = generated_mask.convert("L")
-        enhancement = "none"
-        if self.config.upscale_2x:
-            upscaler = self._get_upscaler()
-            try:
-                final_image = upscaler.upscale(final_image)
-                final_source = final_source.resize(final_image.size, Image.Resampling.LANCZOS)
-                final_observed = final_observed.resize(final_image.size, Image.Resampling.NEAREST)
-                final_generated = final_generated.resize(final_image.size, Image.Resampling.NEAREST)
-                enhancement = upscaler.name
-            except Exception as exc:
-                self._upscaler_failed = True
-                warning = f"Swin2SR enhancement failed; using Lanczos fallback. Reason: {exc}"
-                self._log(warning, level=logging.WARNING)
-                fallback = LanczosUpscaler()
-                final_image = fallback.upscale(image)
-                final_source = source_canvas.resize(final_image.size, Image.Resampling.LANCZOS)
-                final_observed = observed_mask.resize(final_image.size, Image.Resampling.NEAREST)
-                final_generated = generated_mask.resize(final_image.size, Image.Resampling.NEAREST)
-                enhancement = fallback.name
+    def _references(self, anchor: ImageAnalysis, ordered: list[ImageAnalysis]) -> tuple[tuple[Image.Image, ...], list[str]]:
+        chosen = [anchor, *(item for item in ordered if item.path != anchor.path)][:16]
+        if len(ordered) > len(chosen):
+            self._log(f"Using {len(chosen)} references for this photo out of {len(ordered)}; the source is always included.")
+        images = []
+        for item in chosen:
+            self._check_cancelled()
+            image, mask = load_fragment(item.path)
+            images.append(image.crop(mask.getbbox()))
+        return tuple(images), [str(item.path) for item in chosen]
 
-        has_observed_content = final_observed.getbbox() is not None
-        if has_observed_content:
-            final_image.paste(final_source, (0, 0), final_observed)
+    def _prompts(self, subject: SubjectKind, synthetic: bool, index: int) -> tuple[str, str]:
+        from bodybuilder.core.prompts import completion_prompt, variant_prompt
+        if synthetic:
+            _slug, prompt, negative = variant_prompt(subject, index, self.config.variant_frame, self.config.custom_prompt)
+        else:
+            prompt, negative = completion_prompt(subject, self.config.custom_prompt)
+        return prompt, negative + ", collage, contact sheet, grid, panels, blank blocks, black square, white square"
 
-        metadata = {
-            **metadata,
-            "enhancement": enhancement,
-            "observed_pixels_preserved": has_observed_content,
-            "observed_content_preserved": has_observed_content,
-            "observed_working_pixels_preserved_exactly": (
-                has_observed_content and enhancement == "none"
-            ),
-            "observed_region_processing": (
-                "copied exactly from the AI working canvas"
-                if enhancement == "none"
-                else "2x Lanczos resampling from the working canvas; no generative enhancement applied"
-            ),
-            "output_width": final_image.width,
-            "output_height": final_image.height,
-            "provenance_notice": "White pixels in generated_mask were synthesized or filled.",
-        }
-        image_path = output_base.with_suffix(".png")
-        observed_path = output_base.with_name(f"{output_base.name}__observed_mask.png")
-        generated_path = output_base.with_name(f"{output_base.name}__generated_mask.png")
-        comparison_path = output_base.with_name(f"{output_base.name}__comparison.jpg")
-        metadata_path = output_base.with_suffix(".json")
-
-        save_png(final_image, image_path, metadata)
-        save_png(final_observed, observed_path)
-        save_png(final_generated, generated_path)
-        comparison = create_comparison(final_source, final_generated, final_image)
-        save_jpeg(comparison, comparison_path, quality=92)
-
-        record = {
-            **metadata,
-            "image": str(image_path),
-            "observed_mask": str(observed_path),
-            "generated_mask": str(generated_path),
-            "comparison": str(comparison_path),
-            "metadata": str(metadata_path),
-        }
-        write_json(metadata_path, record)
-        self.callbacks.preview(image_path)
-        self._log(f"Saved {image_path}")
+    def _generate(self, backend: GenerationBackend, canvas: PreparedCanvas,
+                  references: tuple[Image.Image, ...], prompt: str, negative: str, slug: str,
+                  seed: int, done: int, total: int, label: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        self._check_cancelled()
+        request = GenerationRequest(canvas.image, canvas.generated_mask, references[0], None,
+            prompt, negative, seed, self.config.inference_steps, self.config.guidance_scale,
+            1.0 if metadata["fully_synthetic"] else self.config.denoising_strength,
+            self.config.reference_fidelity, canvas.image.width, canvas.image.height,
+            fully_synthetic=metadata["fully_synthetic"], reference_images=references)
+        self.callbacks.progress(done, total, label)
+        generated = backend.generate(request, cancel_event=self.cancel_event,
+            progress=lambda step, steps, message: self.callbacks.progress(done, total, f"{label}: {message} {step}/{steps}"))
+        self._check_cancelled()
+        if self.config.backend == BackendKind.SDXL:
+            validate_generation(generated, canvas.image, canvas.generated_mask)
+        reconstructed = preserve_observed_pixels(generated, canvas.image, canvas.generated_mask)
+        assert self.run_dir is not None
+        output_folder = "images" if self.config.backend == BackendKind.SDXL else "diagnostic_previews"
+        record = self._save_output(image=reconstructed, source_canvas=canvas.image,
+            observed_mask=canvas.observed_mask, generated_mask=canvas.generated_mask,
+            output_base=self.run_dir / output_folder / slug,
+            metadata={**metadata, "seed": seed, "prompt": prompt, "negative_prompt": negative,
+                      "backend": backend.name, "model": backend.model_identifier,
+                      "generated_fraction": generated_fraction(canvas.generated_mask),
+                      "technical_validation": "passed" if self.config.backend == BackendKind.SDXL else "diagnostic_only",
+                      "generation": getattr(backend, "last_generation_metadata", {})})
         return record
 
-    def _get_upscaler(self) -> Upscaler:
-        if self._upscaler_failed:
-            return LanczosUpscaler()
-        if self._upscaler is None:
-            self._upscaler = Swin2SRUpscaler(
-                model_id=self.config.model_settings.upscaler_model_id,
-                device=self.config.device,
-                log=self._log,
-            )
-        return self._upscaler
+    def _record_output(self, record: dict[str, Any], result: PipelineRunResult, manifest: dict[str, Any]) -> None:
+        result.output_paths.append(Path(record["image"]))
+        manifest["outputs"].append(record)
+        write_json(result.manifest_path, manifest)
+        self.callbacks.preview(Path(record["image"]))
 
-    def _backend_for(
-        self,
-        subject_kind: SubjectKind,
-        *,
-        use_face_adapter: bool,
-    ) -> GenerationBackend:
+    def _prepare_observed_source(self, analysis: ImageAnalysis, group: list[ImageAnalysis]) -> StitchResult:
+        image, mask = load_fragment(analysis.path)
+        if self.config.stitch_overlaps and self.config.max_stitch_candidates and mask.getextrema() == (255, 255):
+            from bodybuilder.core.stitching import stitch_from_anchor
+            candidates = [item.path for item in group if item.path != analysis.path
+                          and load_fragment(item.path)[1].getextrema() == (255, 255)]
+            return stitch_from_anchor(analysis.path, candidates,
+                max_candidates=self.config.max_stitch_candidates, log=self._log)
+        return StitchResult(image, mask, [analysis.path])
+
+    def _save_output(self, *, image: Image.Image, source_canvas: Image.Image,
+                     observed_mask: Image.Image, generated_mask: Image.Image,
+                     output_base: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+        final, source = image.convert("RGB"), source_canvas.convert("RGB")
+        observed, missing = observed_mask.convert("L"), generated_mask.convert("L")
+        enhancement = "none"
+        if self.config.upscale_2x:
+            from bodybuilder.ai.upscale import LanczosUpscaler, Swin2SRUpscaler
+            if self._upscaler is None:
+                self._upscaler = Swin2SRUpscaler(model_id=self.config.model_settings.upscaler_model_id,
+                    device=self.config.device, log=self._log)
+            try:
+                final = self._upscaler.upscale(final)
+                enhancement = self._upscaler.name
+            except (ImportError, OSError, ValueError, RuntimeError) as exc:
+                self._log(f"AI enhancement unavailable: {exc}. Using deterministic Lanczos resizing.")
+                self._upscaler.close()
+                self._upscaler = LanczosUpscaler()
+                final = self._upscaler.upscale(image)
+                enhancement = self._upscaler.name
+            source = source.resize(final.size, Image.Resampling.LANCZOS)
+            observed = observed.resize(final.size, Image.Resampling.NEAREST)
+            missing = missing.resize(final.size, Image.Resampling.NEAREST)
+        final.paste(source, (0, 0), observed)
+        diagnostics = (self.run_dir or output_base.parent) / "diagnostics" / output_base.name
+        # Dots in source names must not erase the completion suffix.
+        image_path = output_base.parent / (output_base.name + ".png")
+        record = {**metadata, "image": str(image_path), "enhancement": enhancement,
+            "observed_mask": str(diagnostics / "observed_mask.png"),
+            "generated_mask": str(diagnostics / "generated_mask.png"),
+            "observed_working_pixels_preserved_exactly": observed.getbbox() is not None and not self.config.upscale_2x,
+            "observed_region_processing": "2x Lanczos resampling; no AI changes" if self.config.upscale_2x else "Copied exactly from working canvas",
+            "output_width": final.width, "output_height": final.height}
+        save_png(source, diagnostics / "source_canvas.png")
+        save_png(observed, diagnostics / "observed_mask.png")
+        save_png(missing, diagnostics / "generated_mask.png")
+        write_json(diagnostics / "metadata.json", record)
+        save_png(final, image_path, record)
+        self._log(f"Saved result: {image_path}")
+        return record
+
+    def _backend_for(self, subject_kind: SubjectKind, *, use_face_adapter: bool) -> GenerationBackend:
         key = (subject_kind, use_face_adapter)
-        backend = self._backends.get(key)
-        if backend is not None:
-            return backend
-
-        if self._backends:
-            self._log("Releasing the previous generation backend before the next subject group.")
-            for previous in self._backends.values():
-                previous.close()
+        if key not in self._backends:
+            for backend in self._backends.values():
+                backend.close()
             self._backends.clear()
-
-        if self.config.backend == BackendKind.CLASSICAL:
-            backend = ClassicalFillBackend()
-        else:
-            backend = SdxlBackend(
-                subject_kind=subject_kind,
-                device=self.config.device,
-                models=self.config.model_settings,
-                use_face_adapter=use_face_adapter,
-                log=self._log,
-            )
-        self._backends[key] = backend
-        return backend
+            self._backends[key] = ClassicalFillBackend() if self.config.backend == BackendKind.CLASSICAL else SdxlBackend(
+                subject_kind=subject_kind, device=self.config.device, models=self.config.model_settings,
+                use_face_adapter=use_face_adapter, log=self._log)
+        return self._backends[key]
 
     def _resolve_subject_kind(self, group: list[ImageAnalysis]) -> SubjectKind:
-        if self.config.subject_kind != SubjectKind.AUTO:
-            return self.config.subject_kind
-        return SubjectKind.PERSON if any(item.faces for item in group) else SubjectKind.OBJECT
+        # No face detection is not evidence of an object: cropped faces often evade detection.
+        return SubjectKind.PERSON if self.config.subject_kind == SubjectKind.AUTO else self.config.subject_kind
 
     def _seed_for(self, subject_index: int, source_index: int, variant_index: int) -> int:
-        return int(
-            (
-                self.config.seed
-                + subject_index * 1_000_003
-                + source_index * 10_007
-                + variant_index * 101
-            )
-            % (2**32 - 1)
-        )
+        return (self.config.seed + subject_index * 1000003 + source_index * 10007 + variant_index * 101) % (2**32 - 1)
 
-    def _record_error(
-        self,
-        manifest: dict[str, Any],
-        result: PipelineRunResult,
-        *,
-        stage: str,
-        exc: Exception,
-        **context: Any,
-    ) -> dict[str, Any]:
-        error = {
-            "stage": stage,
-            **context,
-            "type": type(exc).__name__,
-            "message": str(exc),
-        }
-        manifest["errors"].append(error)
+    def _record_error(self, exc: Exception, result: PipelineRunResult, manifest: dict[str, Any], source: str) -> None:
+        error = {"source": source, "type": type(exc).__name__, "message": str(exc)}
         result.errors.append(error)
+        manifest["errors"].append(error)
         if self.logger:
-            self.logger.error("Pipeline error: %s\n%s", error, traceback.format_exc())
-        self.callbacks.log(f"ERROR [{stage}] {type(exc).__name__}: {exc}")
-        return error
+            self.logger.exception("Reconstruction failed: %s", error)
+        self.callbacks.log(f"ERROR: {source}: {exc}")
 
     def _check_cancelled(self) -> None:
         if self.cancel_event.is_set():
-            raise PipelineCancelled("Run cancelled")
+            raise PipelineCancelled("Cancelled")
 
     def _validate_paths(self) -> None:
-        if not self.config.input_dir.exists() or not self.config.input_dir.is_dir():
-            raise RuntimeError(f"Input folder does not exist: {self.config.input_dir}")
-        self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            self.config.output_dir.resolve().relative_to(self.config.input_dir.resolve())
-        except ValueError:
-            return
-        raise RuntimeError("The output folder cannot be inside the input folder")
+        source, output = self.config.input_dir.resolve(), self.config.output_dir.resolve()
+        if not source.is_dir():
+            raise ValueError(f"Source folder does not exist: {source}")
+        if output == source or source in output.parents:
+            raise ValueError("Choose an output folder outside the source folder")
+        output.mkdir(parents=True, exist_ok=True)
 
-    def _create_run_directory(self) -> Path:
-        if self.config.run_name:
-            name = safe_stem(self.config.run_name, fallback="BodyBuilder_run")
-        else:
-            name = datetime.now().astimezone().strftime("BodyBuilder_%Y%m%d_%H%M%S")
-        run_dir = ensure_unique_path(self.config.output_dir / name)
-        run_dir.mkdir(parents=True, exist_ok=False)
-        return run_dir
-
-    def _log(self, message: str, *, level: int = logging.INFO) -> None:
+    def _log(self, message: str) -> None:
         if self.logger:
-            self.logger.log(level, message)
+            self.logger.info(message)
         self.callbacks.log(message)
