@@ -147,7 +147,7 @@ class SdxlBackend(GenerationBackend):
                 self.close()
                 self._full_precision = True
                 if cancel_event.is_set():
-                    raise GenerationCancelled("Cancelled")
+                    raise GenerationCancelled("Cancelled") from exc
             except RuntimeError as exc:
                 if isinstance(exc, (GenerationCancelled, BackendFatalError)):
                     raise
