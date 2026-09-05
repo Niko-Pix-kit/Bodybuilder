@@ -1,8 +1,7 @@
-"""Real Diffusers API checks with tiny random components, without model downloads.
+"""Real Diffusers APIs with tiny random components, without model downloads.
 
-These tests verify initialization and VAE execution, not photographic fidelity.
-Only pretrained weight loading and IP-Adapter weight loading are replaced.
-The inpainting pipeline, scheduler, VAE, encoder and device placement are real.
+These tests verify initialization, VAE execution and regional IP-Adapter routing,
+not photographic fidelity. Pretrained weight loading alone is replaced.
 """
 
 from __future__ import annotations
@@ -15,8 +14,6 @@ import pytest
 from bodybuilder.ai.sdxl import SdxlBackend
 from bodybuilder.config import DeviceKind, ModelSettings, SubjectKind
 
-# Core-only installs may skip these tests. The AI compatibility CI job makes
-# them mandatory, so a missing or incompatible dependency fails rather than skips.
 _stack_missing = any(
     importlib.util.find_spec(name) is None for name in ("torch", "diffusers", "transformers")
 )
@@ -86,9 +83,6 @@ def test_prepare_with_real_inpaint_pipeline_and_tiled_vae(monkeypatch, full_prec
         assert isinstance(pipe.scheduler, EulerDiscreteScheduler)
         model.prepare()
         assert calls == ["encoder", "pipeline", "adapter"]
-
-        # Exercise the actual tiled encoder and decoder, not just the API name.
-        # The random weights do not represent the production SDXL checkpoint.
         with torch.inference_mode():
             sample = torch.zeros(1, 3, 24, 24)
             latents = vae.encode(sample).latent_dist.mode()
@@ -98,3 +92,35 @@ def test_prepare_with_real_inpaint_pipeline_and_tiled_vae(monkeypatch, full_prec
     finally:
         model.close()
     assert model._pipe is None
+
+
+def test_real_ip_adapter_routes_distinct_references_to_distinct_regions():
+    from types import SimpleNamespace
+
+    import torch
+    from diffusers.models.attention_processor import Attention, IPAdapterAttnProcessor2_0
+    from PIL import Image
+
+    from bodybuilder.ai.sdxl import reference_mask_array
+
+    top = Image.new("L", (32, 32), 0)
+    top.paste(255, (0, 0, 32, 16))
+    bottom = Image.eval(top, lambda value: 255 - value)
+    request = SimpleNamespace(reference_masks=(top, bottom), reference_images=(top, bottom), width=32, height=32)
+    masks = [torch.from_numpy(reference_mask_array(request))]
+    torch.manual_seed(8)
+    processor = IPAdapterAttnProcessor2_0(hidden_size=16, cross_attention_dim=16,
+                                         num_tokens=(4,), scale=[[.8, .8]])
+    attention = Attention(query_dim=16, cross_attention_dim=16, heads=2, dim_head=8,
+                          processor=processor).eval()
+    hidden = torch.randn(2, 4, 16)
+    text = torch.randn(2, 3, 16)
+    references = torch.randn(2, 2, 4, 16)
+    with torch.inference_mode():
+        before = attention(hidden, encoder_hidden_states=(text, [references]), ip_adapter_masks=masks)
+        changed = references.clone()
+        changed[:, 0] += 2  # Change only the eye reference (top half).
+        after = attention(hidden, encoder_hidden_states=(text, [changed]), ip_adapter_masks=masks)
+    assert not torch.allclose(before[:, :2], after[:, :2])
+    torch.testing.assert_close(before[:, 2:], after[:, 2:], rtol=0, atol=1e-6)
+    assert torch.isfinite(after).all()

@@ -158,6 +158,9 @@ class ReconstructionPipeline:
                 backend.prepare()
                 self._check_cancelled()
                 ordered = sorted(group, key=lambda item: item.quality_score, reverse=True)
+                # Regional selection inspects all originals; a small mouth patch
+                # must not be lost behind 16 globally sharper full-body images.
+                evidence_files = [str(item.path) for item in ordered]
                 for source_index, analysis in enumerate(group, 1):
                     self._check_cancelled()
                     try:
@@ -174,7 +177,8 @@ class ReconstructionPipeline:
                                 f"subject_{group_index:03d}__{source_index:03d}_{safe_stem(analysis.path.stem)}__{index:02d}",
                                 self._seed_for(group_index, source_index, index), done, total, label,
                                 {"kind": "source_completion", "source_file": str(analysis.path),
-                                 "reference_files": reference_paths, "source_files_used": [str(p) for p in observed.used_paths],
+                                 "reference_files": reference_paths, "evidence_files": evidence_files,
+                                 "source_files_used": [str(p) for p in observed.used_paths],
                                  "fully_synthetic": False, "placement": canvas.placement.to_dict()})
                             done += 1
                             self._record_output(record, result, manifest)
@@ -192,7 +196,8 @@ class ReconstructionPipeline:
                     record = self._generate(backend, canvas, references, prompt, negative,
                         f"subject_{group_index:03d}__synthetic_{index + 1:02d}",
                         self._seed_for(group_index, 10000, index), done, total, "Synthetic view",
-                        {"kind": "synthetic_variant", "reference_files": reference_paths, "fully_synthetic": True})
+                        {"kind": "synthetic_variant", "reference_files": reference_paths,
+                         "evidence_files": evidence_files, "fully_synthetic": True})
                     done += 1
                     self._record_output(record, result, manifest)
             if not result.output_paths:
@@ -240,7 +245,7 @@ class ReconstructionPipeline:
     def _references(self, anchor: ImageAnalysis, ordered: list[ImageAnalysis]) -> tuple[tuple[Image.Image, ...], list[str]]:
         chosen = [anchor, *(item for item in ordered if item.path != anchor.path)][:16]
         if len(ordered) > len(chosen):
-            self._log(f"Using {len(chosen)} references for this photo out of {len(ordered)}; the source is always included.")
+            self._log(f"Using {len(chosen)} context references out of {len(ordered)}; facial details are selected separately from all originals.")
         images = []
         for item in chosen:
             self._check_cancelled()
@@ -260,11 +265,17 @@ class ReconstructionPipeline:
                   references: tuple[Image.Image, ...], prompt: str, negative: str, slug: str,
                   seed: int, done: int, total: int, label: str, metadata: dict[str, Any]) -> dict[str, Any]:
         self._check_cancelled()
+        source_file = metadata.get("source_file")
+        # A stitched panorama no longer shares the original's source coordinates.
+        located_source = source_file and len(metadata.get("source_files_used", [])) == 1
         request = GenerationRequest(canvas.image, canvas.generated_mask, references[0], None,
             prompt, negative, seed, self.config.inference_steps, self.config.guidance_scale,
             1.0 if metadata["fully_synthetic"] else self.config.denoising_strength,
             self.config.reference_fidelity, canvas.image.width, canvas.image.height,
-            fully_synthetic=metadata["fully_synthetic"], reference_images=references)
+            fully_synthetic=metadata["fully_synthetic"], reference_images=references,
+            evidence_paths=tuple(Path(p) for p in metadata.get("evidence_files", [])),
+            source_path=Path(source_file) if located_source else None,
+            source_placement=metadata.get("placement") if located_source else None)
         self.callbacks.progress(done, total, label)
         generated = backend.generate(request, cancel_event=self.cancel_event,
             progress=lambda step, steps, message: self.callbacks.progress(done, total, f"{label}: {message} {step}/{steps}"))
@@ -325,7 +336,6 @@ class ReconstructionPipeline:
             missing = missing.resize(final.size, Image.Resampling.NEAREST)
         final.paste(source, (0, 0), observed)
         diagnostics = (self.run_dir or output_base.parent) / "diagnostics" / output_base.name
-        # Dots in source names must not erase the completion suffix.
         image_path = output_base.parent / (output_base.name + ".png")
         record = {**metadata, "image": str(image_path), "enhancement": enhancement,
             "observed_mask": str(diagnostics / "observed_mask.png"),
@@ -353,7 +363,6 @@ class ReconstructionPipeline:
         return self._backends[key]
 
     def _resolve_subject_kind(self, group: list[ImageAnalysis]) -> SubjectKind:
-        # No face detection is not evidence of an object: cropped faces often evade detection.
         return SubjectKind.PERSON if self.config.subject_kind == SubjectKind.AUTO else self.config.subject_kind
 
     def _seed_for(self, subject_index: int, source_index: int, variant_index: int) -> int:

@@ -1,4 +1,4 @@
-"""Reference-conditioned SDXL. A failed reference adapter is a hard error."""
+"""Reference-conditioned SDXL with optional spatial facial-detail refinement."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 from PIL import Image, ImageOps
 
 from bodybuilder.ai.base import (
@@ -30,8 +31,18 @@ def prepare_reference_images(images: tuple[Image.Image, ...]) -> list[Image.Imag
                         method=Image.Resampling.LANCZOS, color=(127, 127, 127)) for image in images]
 
 
+def reference_mask_array(request: GenerationRequest) -> np.ndarray:
+    """Diffusers shape: one batch, N reference images, height, width."""
+    if not request.reference_masks or len(request.reference_masks) != len(request.reference_images):
+        raise ValueError("Each regional reference must have exactly one output-space mask")
+    if any(mask.size != (request.width, request.height) for mask in request.reference_masks):
+        raise ValueError("Reference masks must match the output canvas size")
+    return np.stack([np.asarray(mask.convert("L"), dtype=np.float32) / 255
+                     for mask in request.reference_masks])[None]
+
+
 class SdxlBackend(GenerationBackend):
-    name = "SDXL with mandatory multi-image references"
+    name = "SDXL with mandatory multi-image and regional references"
 
     def __init__(self, *, subject_kind: SubjectKind, device: DeviceKind,
                  models: ModelSettings, use_face_adapter: bool,
@@ -82,9 +93,7 @@ class SdxlBackend(GenerationBackend):
             encoder = CLIPVisionModelWithProjection.from_pretrained(
                 self.models.ip_adapter_model_id,
                 subfolder=self.models.ip_adapter_image_encoder_subfolder,
-                torch_dtype=dtype,
-                use_safetensors=True,
-            )
+                torch_dtype=dtype, use_safetensors=True)
             pipe = AutoPipelineForInpainting.from_pretrained(
                 self.models.inpainting_model_id, image_encoder=encoder,
                 torch_dtype=dtype, use_safetensors=True)
@@ -94,10 +103,7 @@ class SdxlBackend(GenerationBackend):
                                  weight_name=self.models.ip_adapter_weight_name,
                                  image_encoder_folder=None)
             pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
-            # SDXL's original VAE must upcast its encoder/decoder when using fp16.
             pipe.vae.register_to_config(force_upcast=True)
-            # Use AutoencoderKL's public API. The pipeline-level convenience
-            # method enable_vae_tiling is not available in all Diffusers releases.
             pipe.vae.enable_tiling()
             # Load every component BEFORE installing accelerate offload hooks.
             if self._device == "cuda":
@@ -114,6 +120,13 @@ class SdxlBackend(GenerationBackend):
 
     def generate(self, request: GenerationRequest, *, cancel_event: threading.Event,
                  progress: ProgressCallback | None = None) -> Image.Image:
+        if self.subject_kind in (SubjectKind.PERSON, SubjectKind.AUTO) and request.evidence_paths:
+            from bodybuilder.ai.details import generate_with_details
+            return generate_with_details(self, request, cancel_event=cancel_event, progress=progress)
+        return self._generate_validated(request, cancel_event=cancel_event, progress=progress)
+
+    def _generate_validated(self, request: GenerationRequest, *, cancel_event: threading.Event,
+                            progress: ProgressCallback | None = None) -> Image.Image:
         if cancel_event.is_set():
             raise GenerationCancelled("Cancelled")
         if request.generated_mask.getbbox() is None:
@@ -123,12 +136,15 @@ class SdxlBackend(GenerationBackend):
             raise BackendFatalError("No individual reference photographs were supplied")
         if int(request.steps * request.strength) < 1:
             raise BackendFatalError("The current strength/steps would perform no denoising")
+        if request.reference_masks:
+            reference_mask_array(request)  # Validate before loading expensive models.
         for attempt in range(2):
             self.prepare()
             if cancel_event.is_set():
                 raise GenerationCancelled("Cancelled")
             seed = (request.seed + attempt) % (2**32)
-            fidelity = request.reference_fidelity if not attempt else min(request.reference_fidelity, 0.5)
+            # A numerical retry must not silently weaken the reference constraint.
+            fidelity = request.reference_fidelity
             try:
                 image = self._generate_once(request, seed, fidelity, cancel_event, progress)
                 validate_generation(image, request.canvas, request.generated_mask)
@@ -138,6 +154,7 @@ class SdxlBackend(GenerationBackend):
                     "full_precision_retry": self._full_precision,
                     "reference_fidelity": fidelity,
                     "reference_adapter": self.models.ip_adapter_weight_name,
+                    "spatial_reference_masks": bool(request.reference_masks),
                 }
                 return image
             except InvalidGenerationError as exc:
@@ -163,7 +180,14 @@ class SdxlBackend(GenerationBackend):
     def _generate_once(self, request: GenerationRequest, seed: int, fidelity: float,
                        cancel_event: threading.Event, progress: ProgressCallback | None) -> Image.Image:
         pipe, torch = self._pipe, self._torch
-        pipe.set_ip_adapter_scale(fidelity)
+        extra = {}
+        if request.reference_masks:
+            masks = torch.from_numpy(reference_mask_array(request))
+            # Outer list: one adapter. Inner mask dimension: its reference images.
+            extra["cross_attention_kwargs"] = {"ip_adapter_masks": [masks]}
+            pipe.set_ip_adapter_scale([[fidelity] * len(request.reference_images)])
+        else:
+            pipe.set_ip_adapter_scale(fidelity)
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
         def on_step(_pipe: Any, step: int, _time: Any, data: dict[str, Any]) -> dict[str, Any]:
@@ -180,12 +204,11 @@ class SdxlBackend(GenerationBackend):
             result = pipe(
                 prompt=request.prompt, negative_prompt=request.negative_prompt,
                 image=request.canvas, mask_image=request.generated_mask,
-                # Outer list = adapter; inner list = images for that one adapter.
                 ip_adapter_image=[prepare_reference_images(request.reference_images)],
                 strength=request.strength, num_inference_steps=request.steps,
                 guidance_scale=request.guidance_scale, generator=generator,
                 width=request.width, height=request.height,
-                callback_on_step_end=on_step, output_type="np")
+                callback_on_step_end=on_step, output_type="np", **extra)
         if cancel_event.is_set():
             raise GenerationCancelled("Cancelled")
         flagged = getattr(result, "nsfw_content_detected", None)

@@ -21,6 +21,20 @@ if register_heif_opener is not None:
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".heic", ".heif"}
 
 
+def is_generated_image(path: Path) -> bool:
+    """Recognise our exported PNGs even after copying them out of a run folder.
+
+Metadata stripped by a screenshot or another editor cannot be reliably detected.
+A normal image merely having 'generated' in its filename is not rejected.
+"""
+    try:
+        with Image.open(path) as image:
+            return "BodyBuilder" in image.info
+    except OSError:
+        # Discovery leaves corrupt files to the normal decode-error reporting path.
+        return False
+
+
 def scan_images(folder: Path, *, recursive: bool = True) -> list[Path]:
     folder = Path(folder)
     iterator = folder.rglob("*") if recursive else folder.glob("*")
@@ -32,8 +46,10 @@ def scan_images(folder: Path, *, recursive: bool = True) -> list[Path]:
             continue
         if path.name.lower().endswith((".mask.png", "_observed_mask.png", "_generated_mask.png")):
             continue
-        # Walk only inside the selected source tree, excluding earlier BodyBuilder runs.
-        if any((parent / "run_manifest.json").exists() for parent in path.parents if parent == folder or folder in parent.parents):
+        if any((parent / "run_manifest.json").exists() for parent in path.parents
+               if parent == folder or folder in parent.parents):
+            continue
+        if is_generated_image(path):
             continue
         paths.append(path)
     return sorted(paths, key=lambda path: str(path).casefold())
@@ -60,7 +76,6 @@ def load_fragment(path: Path) -> tuple[Image.Image, Image.Image]:
             observed.paste(0, mask=missing.point(lambda value: 255 if value > 127 else 0))
     if observed.getbbox() is None:
         raise ValueError(f"No observed pixels remain in {path.name}")
-    # Replace known missing areas by a neutral placeholder, not invented evidence.
     rgb.paste((127, 127, 127), mask=ImageOps.invert(observed))
     return rgb, observed
 

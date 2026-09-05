@@ -43,8 +43,8 @@ def main() -> int:
     app.setApplicationName("BodyBuilder")
     app.setOrganizationName("Niko-Pix-kit")
     try:
-        from bodybuilder.ui.main_window import MainWindow
-        window = MainWindow()
+        from bodybuilder.ui.guided_window import GuidedMainWindow
+        window = GuidedMainWindow()
     except Exception:
         # Startup boundary: report and exit nonzero, without swallowing the traceback.
         unhandled(*sys.exc_info())

@@ -57,6 +57,12 @@ class GenerationRequest:
     height: int
     fully_synthetic: bool = False
     reference_images: tuple[Image.Image, ...] = ()
+    # All originals in this subject group, not just the globally highest quality 16.
+    evidence_paths: tuple[Path, ...] = ()
+    source_path: Path | None = None
+    source_placement: dict[str, int] | None = None
+    # One output-space mask per image, for the single loaded IP-Adapter.
+    reference_masks: tuple[Image.Image, ...] = ()
 
 
 @dataclass(slots=True)
