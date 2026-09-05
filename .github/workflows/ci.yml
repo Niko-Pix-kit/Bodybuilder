@@ -31,3 +31,38 @@ jobs:
         run: python -m compileall -q src tests
       - name: Test core and offscreen desktop UI (no model downloads)
         run: pytest
+
+  ai-api:
+    name: Real AI APIs (${{ matrix.stack }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - stack: minimum
+            diffusers: diffusers==0.31.0
+            transformers: transformers==4.44.2
+          - stack: current
+            diffusers: diffusers
+            transformers: transformers
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU PyTorch
+        run: python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - name: Install real AI libraries and tests
+        run: python -m pip install -e ".[ai,dev]" "${{ matrix.diffusers }}" "${{ matrix.transformers }}"
+      - name: Record installed versions
+        run: python -m pip freeze
+      - name: Verify real inpainting and VAE APIs without downloading model weights
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          BODYBUILDER_REQUIRE_AI_TESTS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+        run: python -m pytest tests/test_diffusers_runtime.py -v

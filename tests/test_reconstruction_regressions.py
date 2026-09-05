@@ -166,7 +166,7 @@ def test_missing_references_are_fatal():
         backend().generate(data, cancel_event=threading.Event())
 
 
-def mock_stack(monkeypatch, *, adapter_fails=False):
+def mock_stack(monkeypatch, *, adapter_fails=False, tiling_error=None, cuda_available=True):
     import sys
     calls = []
     class Generator:
@@ -175,19 +175,29 @@ def mock_stack(monkeypatch, *, adapter_fails=False):
         def manual_seed(self, seed):
             return self
     torch = SimpleNamespace(float16="fp16", float32="fp32", Generator=Generator,
-        cuda=SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
+        cuda=SimpleNamespace(is_available=lambda: cuda_available, empty_cache=lambda: None),
         backends=SimpleNamespace(), inference_mode=nullcontext, isfinite=np.isfinite)
+    def enable_tiling():
+        calls.append(("tiling", {}))
+        if tiling_error is not None:
+            raise tiling_error
     class Pipe:
-        vae = SimpleNamespace(register_to_config=lambda **kwargs: calls.append(("vae", kwargs)))
+        # Deliberately no pipeline.enable_vae_tiling convenience wrapper: use the
+        # VAE's real API shape so an invented mock method cannot conceal this bug.
+        vae = SimpleNamespace(
+            register_to_config=lambda **kwargs: calls.append(("vae", kwargs)),
+            enable_tiling=enable_tiling,
+        )
         scheduler = SimpleNamespace(config={})
         def load_ip_adapter(self, *args, **kwargs):
             calls.append(("adapter", kwargs))
             if adapter_fails:
                 raise ValueError("wrong encoder")
-        def enable_vae_tiling(self):
-            pass
         def enable_model_cpu_offload(self):
             calls.append(("offload", {}))
+        def to(self, device):
+            calls.append(("to", {"device": device}))
+            return self
         def set_ip_adapter_scale(self, scale):
             pass
         def __call__(self, **kwargs):
@@ -216,10 +226,53 @@ def test_correct_encoder_mandatory_adapter_and_nested_individual_images(monkeypa
     assert mapping["encoder"]["subfolder"] == "models/image_encoder"
     assert mapping["pipe"]["image_encoder"] == "correct-encoder"
     assert mapping["adapter"]["image_encoder_folder"] is None
-    assert [name for name, _ in calls].index("adapter") < [name for name, _ in calls].index("offload")
+    names = [name for name, _ in calls]
+    assert names.index("adapter") < names.index("tiling") < names.index("offload")
     assert mapping["vae"]["force_upcast"] is True
+    assert not hasattr(model._pipe, "enable_vae_tiling")
     assert len(mapping["generate"]["ip_adapter_image"]) == 1
     assert isinstance(mapping["generate"]["ip_adapter_image"][0], list)
+
+
+def test_prepare_uses_vae_api_on_cpu_and_is_idempotent(monkeypatch):
+    calls = mock_stack(monkeypatch, cuda_available=False)
+    model = backend()
+    model.prepare()
+    pipe = model._pipe
+    model.prepare()
+    assert model._pipe is pipe
+    assert dict(calls)["to"]["device"] == "cpu"
+    names = [name for name, _ in calls]
+    assert names.count("tiling") == 1
+    assert names.count("pipe") == 1
+    assert names.index("tiling") < names.index("to")
+    assert "offload" not in names
+
+
+@pytest.mark.parametrize("error_type", [AttributeError, RuntimeError])
+def test_vae_initialization_error_cleans_up_and_keeps_cause(monkeypatch, error_type):
+    original = error_type("VAE tiling setup failed")
+    calls = mock_stack(monkeypatch, tiling_error=original)
+    model = backend()
+    with pytest.raises(BackendFatalError, match="VAE tiling setup failed") as caught:
+        model.prepare()
+    assert caught.value.__cause__ is original
+    assert model._pipe is None
+    assert "offload" not in dict(calls)
+    assert "generate" not in dict(calls)
+
+
+def test_failed_initialization_can_be_retried_after_fixing_stack(monkeypatch):
+    calls = mock_stack(monkeypatch, tiling_error=AttributeError("incompatible API"))
+    model = backend()
+    with pytest.raises(BackendFatalError):
+        model.prepare()
+    assert "generate" not in dict(calls)
+    retry_calls = mock_stack(monkeypatch)
+    model.prepare()
+    assert model._pipe is not None
+    assert "tiling" in dict(retry_calls)
+    assert "offload" in dict(retry_calls)
 
 
 def test_adapter_failure_never_continues_without_references(monkeypatch):

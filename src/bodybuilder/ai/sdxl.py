@@ -96,18 +96,20 @@ class SdxlBackend(GenerationBackend):
             pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
             # SDXL's original VAE must upcast its encoder/decoder when using fp16.
             pipe.vae.register_to_config(force_upcast=True)
-            pipe.enable_vae_tiling()
+            # Use AutoencoderKL's public API. The pipeline-level convenience
+            # method enable_vae_tiling is not available in all Diffusers releases.
+            pipe.vae.enable_tiling()
             # Load every component BEFORE installing accelerate offload hooks.
             if self._device == "cuda":
                 pipe.enable_model_cpu_offload()
             else:
                 pipe.to(self._device)
-        except (OSError, RuntimeError, ValueError, TypeError, KeyError, ImportError) as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, ImportError, AttributeError) as exc:
             self.close()
             raise BackendFatalError(
-                "Could not load SDXL and its reference-image adapter. Stopped rather than "
+                "Could not initialize SDXL and its reference-image adapter. Stopped rather than "
                 "generating without your photographs. Check the model download, free memory "
-                "and dependency installation. Details: " + str(exc)) from exc
+                "and compatibility of the installed AI libraries. Details: " + str(exc)) from exc
         self.log("Reference adapter ready. Each reference is encoded separately, not as a collage.")
 
     def generate(self, request: GenerationRequest, *, cancel_event: threading.Event,
